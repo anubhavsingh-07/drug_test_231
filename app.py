@@ -5,7 +5,6 @@ from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# ArUco Configuration: DICT_4X4_1000
 ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)
 try:
     DETECTOR = cv2.aruco.ArucoDetector(ARUCO_DICT, cv2.aruco.DetectorParameters())
@@ -20,7 +19,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>NDPS Field Assay Calibration</title>
+    <title>NDPS Field Assay System</title>
     <style>
         :root {
             --bg: #090a0f;
@@ -35,13 +34,7 @@ HTML_TEMPLATE = """
             --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
 
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-            -webkit-tap-highlight-color: transparent;
-        }
-
+        * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
             background-color: var(--bg);
             color: var(--text-primary);
@@ -56,245 +49,238 @@ HTML_TEMPLATE = """
             max-width: 460px;
             display: flex;
             flex-direction: column;
-            gap: 16px;
+            gap: 12px;
         }
 
         header {
             border-bottom: 1px solid var(--border);
-            padding-bottom: 12px;
+            padding-bottom: 10px;
         }
 
         .sys-title {
-            font-size: 13px;
+            font-size: 12px;
             font-weight: 700;
             letter-spacing: 1px;
             text-transform: uppercase;
-            color: var(--text-primary);
         }
 
         .sys-meta {
             font-family: var(--font-mono);
-            font-size: 11px;
+            font-size: 10px;
             color: var(--text-secondary);
-            margin-top: 4px;
+            margin-top: 2px;
         }
 
-        .capture-card {
-            background-color: var(--panel);
-            border: 1px dashed var(--border);
-            padding: 24px 16px;
-            text-align: center;
+        .viewport-wrapper {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 1 / 1;
+            background: #000;
+            border: 1px solid var(--border);
             border-radius: 4px;
+            overflow: hidden;
         }
 
-        .file-label {
-            display: block;
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .overlay-box {
+            position: absolute;
+            inset: 15%;
+            border: 1px dashed rgba(255, 255, 255, 0.3);
+            pointer-events: none;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .overlay-text {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            color: rgba(255, 255, 255, 0.5);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .btn {
             background-color: var(--accent);
             color: #fff;
-            padding: 12px 16px;
-            font-size: 13px;
+            border: none;
+            padding: 12px;
+            font-size: 12px;
             font-family: var(--font-mono);
             font-weight: 600;
             letter-spacing: 0.5px;
             text-transform: uppercase;
             cursor: pointer;
             border-radius: 2px;
+            width: 100%;
         }
 
-        .file-input {
-            display: none;
-        }
-
-        .hint {
-            font-size: 11px;
+        .btn:disabled {
+            background-color: var(--border);
             color: var(--text-secondary);
-            margin-top: 10px;
-            font-family: var(--font-mono);
+            cursor: not-allowed;
         }
 
-        #processing {
-            display: none;
-            background: var(--panel);
-            border: 1px solid var(--border);
-            padding: 14px;
-            font-family: var(--font-mono);
-            font-size: 12px;
-            color: var(--text-secondary);
-            text-align: center;
-        }
-
-        #results {
+        #panel {
             display: none;
             background-color: var(--panel);
             border: 1px solid var(--border);
             border-radius: 4px;
-            overflow: hidden;
+            padding: 12px;
         }
 
-        .status-bar {
-            padding: 10px 14px;
+        .status {
             font-family: var(--font-mono);
             font-size: 12px;
             font-weight: 700;
-            letter-spacing: 0.5px;
+            padding-bottom: 8px;
             border-bottom: 1px solid var(--border);
             text-transform: uppercase;
         }
 
-        .status-success {
-            background-color: rgba(0, 184, 107, 0.1);
-            color: var(--success);
-            border-color: rgba(0, 184, 107, 0.2);
+        .chart-box {
+            margin-top: 10px;
         }
 
-        .status-failed {
-            background-color: rgba(230, 57, 70, 0.1);
-            color: var(--danger);
-            border-color: rgba(230, 57, 70, 0.2);
-        }
-
-        .data-table {
-            width: 100%;
-            border-collapse: collapse;
+        .chart-title {
             font-family: var(--font-mono);
-            font-size: 11px;
-        }
-
-        .data-table tr {
-            border-bottom: 1px solid var(--border);
-        }
-
-        .data-table td {
-            padding: 10px 14px;
-        }
-
-        .data-table td:first-child {
+            font-size: 10px;
             color: var(--text-secondary);
-            width: 40%;
-        }
-
-        .data-table td:last-child {
-            color: var(--text-primary);
-            text-align: right;
-            font-weight: 600;
-        }
-
-        .preview-container {
-            padding: 14px;
-            border-top: 1px solid var(--border);
-        }
-
-        .preview-title {
-            font-family: var(--font-mono);
-            font-size: 11px;
-            color: var(--text-secondary);
-            margin-bottom: 8px;
             text-transform: uppercase;
+            margin-bottom: 6px;
         }
 
-        .preview-img {
+        svg {
             width: 100%;
-            display: block;
+            height: 120px;
+            background: #0d0f17;
             border: 1px solid var(--border);
-            border-radius: 2px;
+        }
+
+        .data-list {
+            margin-top: 10px;
+            display: flex;
+            justify-content: space-between;
+            font-family: var(--font-mono);
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        .data-list span {
+            color: var(--text-primary);
+            font-weight: 600;
         }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <div class="sys-title">Optical Assay Calibration Unit</div>
-            <div class="sys-meta">NDPS SEC 52A // REF: ARUCO 4X4 // D65 NORMALIZED</div>
+            <div class="sys-title">NDPS Reagent Kinetic Analyzer</div>
+            <div class="sys-meta">SEC 52A // 5-POINT TEMPORAL ASSAY // ARUCO 4X4</div>
         </header>
 
-        <div class="capture-card">
-            <label class="file-label" for="cameraInput">Acquire Target Scan</label>
-            <input type="file" id="cameraInput" class="file-input" accept="image/*" capture="environment">
-            <div class="hint">Center all 4 corner markers in camera frame</div>
+        <div class="viewport-wrapper">
+            <video id="webcam" autoplay playsinline muted></video>
+            <div class="overlay-box">
+                <span class="overlay-text">Align Card Corners Here</span>
+            </div>
         </div>
 
-        <div id="processing">CALIBRATING PERSPECTIVE & ILLUMINATION...</div>
+        <button id="recordBtn" class="btn">Record 5s Kinetic Assay</button>
 
-        <div id="results">
-            <div id="statusBar" class="status-bar"></div>
-            <table class="data-table">
-                <tbody>
-                    <tr>
-                        <td>GEOMETRIC LOCK</td>
-                        <td id="lockData">--</td>
-                    </tr>
-                    <tr>
-                        <td>WHITE BALANCE GAIN</td>
-                        <td id="gainData">--</td>
-                    </tr>
-                    <tr>
-                        <td>NORMALIZED RGB</td>
-                        <td id="rgbData">--</td>
-                    </tr>
-                    <tr>
-                        <td>PRESUMPTIVE ASSAY</td>
-                        <td id="assayData">--</td>
-                    </tr>
-                </tbody>
-            </table>
-            <div class="preview-container">
-                <div class="preview-title">Rectified Output Matrix</div>
-                <img id="calibratedPreview" class="preview-img" alt="Orthorectified View">
+        <div id="panel">
+            <div id="statusText" class="status"></div>
+            
+            <div class="chart-box">
+                <div class="chart-title">Reaction Kinetics (Delta-E vs Time)</div>
+                <svg id="graph" viewBox="0 0 300 100">
+                    <line x1="30" y1="85" x2="280" y2="85" stroke="#222736" stroke-width="1" />
+                    <line x1="30" y1="15" x2="30" y2="85" stroke="#222736" stroke-width="1" />
+                    <polyline id="curve" fill="none" stroke="#2e66ff" stroke-width="2" points="" />
+                </svg>
+            </div>
+
+            <div class="data-list">
+                <div>RATE (dE/dt): <span id="rateVal">--</span></div>
+                <div>FINAL RGB: <span id="rgbVal">--</span></div>
             </div>
         </div>
     </div>
 
+    <canvas id="offscreenCanvas" width="640" height="640" style="display:none;"></canvas>
+
     <script>
-        const input = document.getElementById('cameraInput');
-        const processing = document.getElementById('processing');
-        const results = document.getElementById('results');
-        const statusBar = document.getElementById('statusBar');
+        const video = document.getElementById('webcam');
+        const recordBtn = document.getElementById('recordBtn');
+        const panel = document.getElementById('panel');
+        const statusText = document.getElementById('statusText');
+        const canvas = document.getElementById('offscreenCanvas');
+        const ctx = canvas.getContext('2d');
+        const curve = document.getElementById('curve');
 
-        input.addEventListener('change', async (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
+        navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 1280 } }
+        }).then(stream => {
+            video.srcObject = stream;
+        }).catch(err => {
+            alert("Camera access denied or unavailable.");
+        });
 
-            processing.style.display = 'block';
-            results.style.display = 'none';
+        recordBtn.addEventListener('click', async () => {
+            recordBtn.disabled = true;
+            panel.style.display = 'none';
 
-            const formData = new FormData();
-            formData.append('target_image', file);
+            const frames = [];
+            for (let i = 0; i < 5; i++) {
+                recordBtn.innerText = `SAMPLING REACTION (${i + 1}/5)...`;
+                ctx.drawImage(video, 0, 0, 640, 640);
+                frames.push(canvas.toDataURL('image/jpeg', 0.7));
+                if (i < 4) await new Promise(r => setTimeout(r, 1000));
+            }
+
+            recordBtn.innerText = "PROCESSING ASSAY...";
 
             try {
-                const response = await fetch('/api/calibrate', {
+                const res = await fetch('/api/kinetic_assay', {
                     method: 'POST',
-                    body: formData
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ frames })
                 });
-                const data = await response.json();
+                const data = await res.json();
 
-                processing.style.display = 'none';
-                results.style.display = 'block';
+                panel.style.display = 'block';
+                recordBtn.disabled = false;
+                recordBtn.innerText = "Record 5s Kinetic Assay";
 
                 if (data.success) {
-                    statusBar.className = 'status-bar status-success';
-                    statusBar.innerText = 'LOCK ACQUIRED: OPTICAL MATRIX STABLE';
-                    document.getElementById('lockData').innerText = `4/4 (IDs ${data.ids.join(',')})`;
-                    document.getElementById('gainData').innerText = `R:${data.gains.r} G:${data.gains.g} B:${data.gains.b}`;
-                    document.getElementById('rgbData').innerText = `(${data.rgb.r}, ${data.rgb.g}, ${data.rgb.b})`;
-                    document.getElementById('assayData').innerText = data.assay_result;
-                    document.getElementById('calibratedPreview').src = data.rectified_image;
-                    document.querySelector('.preview-container').style.display = 'block';
+                    statusText.innerText = data.verdict;
+                    statusText.style.color = data.positive ? 'var(--success)' : (data.is_dye ? 'var(--danger)' : 'var(--text-secondary)');
+                    document.getElementById('rateVal').innerText = data.slope;
+                    document.getElementById('rgbVal').innerText = `(${data.final_rgb.r}, ${data.final_rgb.g}, ${data.final_rgb.b})`;
+
+                    // Render SVG kinetic points: scale x [0..4] to [40..270], y [0..max_de] to [80..20]
+                    const maxDe = Math.max(...data.delta_e_series, 50);
+                    const pts = data.delta_e_series.map((val, idx) => {
+                        const x = 40 + (idx * 55);
+                        const y = 80 - ((val / maxDe) * 60);
+                        return `${x},${y}`;
+                    }).join(' ');
+                    curve.setAttribute('points', pts);
+                    curve.setAttribute('stroke', data.positive ? '#00b86b' : (data.is_dye ? '#e63946' : '#2e66ff'));
                 } else {
-                    statusBar.className = 'status-bar status-failed';
-                    statusBar.innerText = 'LOCK FAILED: ' + data.error_code;
-                    document.getElementById('lockData').innerText = data.detected_markers || 'None';
-                    document.getElementById('gainData').innerText = '--';
-                    document.getElementById('rgbData').innerText = '--';
-                    document.getElementById('assayData').innerText = data.message;
-                    document.querySelector('.preview-container').style.display = 'none';
+                    statusText.innerText = "LOCK FAILED: " + data.message;
+                    statusText.style.color = 'var(--danger)';
+                    curve.setAttribute('points', "");
                 }
             } catch (err) {
-                processing.style.display = 'none';
-                results.style.display = 'block';
-                statusBar.className = 'status-bar status-failed';
-                statusBar.innerText = 'NETWORK / TRANSMISSION ERROR';
-                document.getElementById('assayData').innerText = err.message;
-                document.querySelector('.preview-container').style.display = 'none';
+                alert("Network error processing assay.");
+                recordBtn.disabled = false;
+                recordBtn.innerText = "Record 5s Kinetic Assay";
             }
         });
     </script>
@@ -302,20 +288,12 @@ HTML_TEMPLATE = """
 </html>
 """
 
-@app.route('/')
-def root():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/api/calibrate', methods=['POST'])
-def calibrate():
-    file = request.files.get('target_image')
-    if not file:
-        return jsonify({'success': False, 'error_code': 'NO_DATA', 'message': 'No image stream uploaded.'})
-
-    file_bytes = np.frombuffer(file.read(), np.uint8)
+def extract_well_lab(frame_b64):
+    header, encoded = frame_b64.split(",", 1)
+    file_bytes = np.frombuffer(base64.b64decode(encoded), np.uint8)
     frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     if frame is None:
-        return jsonify({'success': False, 'error_code': 'DECODE_ERROR', 'message': 'Corrupt image payload.'})
+        return None, None
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     if USE_NEW_API:
@@ -324,90 +302,103 @@ def calibrate():
         corners, ids, _ = cv2.aruco.detectMarkers(gray, ARUCO_DICT, parameters=PARAMS)
 
     if ids is None or len(ids) < 4:
-        found = ids.flatten().tolist() if ids is not None else []
-        return jsonify({
-            'success': False,
-            'error_code': 'INCOMPLETE_CONSTELLATION',
-            'detected_markers': f"IDs {found}",
-            'message': 'All 4 corner markers (0, 1, 2, 3) must be visible.'
-        })
+        return None, None
 
     id_list = ids.flatten().tolist()
     if not all(idx in id_list for idx in [0, 1, 2, 3]):
-        return jsonify({
-            'success': False,
-            'error_code': 'INVALID_ID_SET',
-            'detected_markers': f"IDs {id_list}",
-            'message': 'Missing one or more required markers (0, 1, 2, 3).'
-        })
+        return None, None
 
-    # Order outer boundary points
     c0 = corners[id_list.index(0)][0][0]
     c1 = corners[id_list.index(1)][0][1]
     c2 = corners[id_list.index(2)][0][2]
     c3 = corners[id_list.index(3)][0][3]
 
     src_pts = np.float32([c0, c1, c2, c3])
-    CANVAS_SIZE = 600
-    dst_pts = np.float32([
-        [0, 0],
-        [CANVAS_SIZE, 0],
-        [CANVAS_SIZE, CANVAS_SIZE],
-        [0, CANVAS_SIZE]
-    ])
+    SIZE = 600
+    dst_pts = np.float32([[0, 0], [SIZE, 0], [SIZE, SIZE], [0, SIZE]])
 
-    # Perspective rectification
     matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
-    warped = cv2.warpPerspective(frame, matrix, (CANVAS_SIZE, CANVAS_SIZE))
+    warped = cv2.warpPerspective(frame, matrix, (SIZE, SIZE))
 
-    # Color normalization against 18% neutral gray patch
-    # Target coordinates on 600x600 plane: y: 50..100, x: 225..375
-    gray_roi = warped[50:100, 225:375]
-    b_mean = float(np.mean(gray_roi[:, :, 0]))
-    g_mean = float(np.mean(gray_roi[:, :, 1]))
-    r_mean = float(np.mean(gray_roi[:, :, 2]))
+    # Optical gray patch calibration
+    gray_roi = warped[40:110, 220:380]
+    b_mean = max(float(np.mean(gray_roi[:, :, 0])), 1.0)
+    g_mean = max(float(np.mean(gray_roi[:, :, 1])), 1.0)
+    r_mean = max(float(np.mean(gray_roi[:, :, 2])), 1.0)
 
-    TARGET_GRAY = 119.0
-    gain_b = TARGET_GRAY / max(b_mean, 1.0)
-    gain_g = TARGET_GRAY / max(g_mean, 1.0)
-    gain_r = TARGET_GRAY / max(r_mean, 1.0)
-
+    TARGET = 119.0
     calibrated = warped.astype(np.float32)
-    calibrated[:, :, 0] = np.clip(calibrated[:, :, 0] * gain_b, 0, 255)
-    calibrated[:, :, 1] = np.clip(calibrated[:, :, 1] * gain_g, 0, 255)
-    calibrated[:, :, 2] = np.clip(calibrated[:, :, 2] * gain_r, 0, 255)
+    calibrated[:, :, 0] = np.clip(calibrated[:, :, 0] * (TARGET / b_mean), 0, 255)
+    calibrated[:, :, 1] = np.clip(calibrated[:, :, 1] * (TARGET / g_mean), 0, 255)
+    calibrated[:, :, 2] = np.clip(calibrated[:, :, 2] * (TARGET / r_mean), 0, 255)
     calibrated = calibrated.astype(np.uint8)
 
-    # Reaction well analysis: y: 220..380, x: 220..380
-    well_roi = calibrated[220:380, 220:380]
-    well_b = int(np.mean(well_roi[:, :, 0]))
-    well_g = int(np.mean(well_roi[:, :, 1]))
-    well_r = int(np.mean(well_roi[:, :, 2]))
+    # Reaction well sampling: center is at x:300, y:300, sample 100x100 box
+    well = calibrated[250:350, 250:350]
+    lab_well = cv2.cvtColor(well, cv2.COLOR_BGR2LAB)
+    
+    avg_lab = np.mean(lab_well, axis=(0, 1))
+    avg_rgb = [int(np.mean(well[:, :, 2])), int(np.mean(well[:, :, 1])), int(np.mean(well[:, :, 0]))]
+    return avg_lab, avg_rgb
 
-    # Quantitative presumptive assessment
-    if well_b > (well_r + 25) and well_b > well_g:
-        assay_status = "COBALT BLUE CONFIRMED (SCOTT POSITIVE)"
+@app.route('/')
+def root():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/kinetic_assay', methods=['POST'])
+def kinetic_assay():
+    data = request.get_json() or {}
+    frames = data.get('frames', [])
+
+    if len(frames) != 5:
+        return jsonify({'success': False, 'message': 'Requires exactly 5 temporal frames.'})
+
+    lab_series = []
+    final_rgb = [0, 0, 0]
+
+    for frame_b64 in frames:
+        lab, rgb = extract_well_lab(frame_b64)
+        if lab is None:
+            return jsonify({'success': False, 'message': 'Card tracking lost during 5s burst. Keep frame stable.'})
+        lab_series.append(lab)
+        final_rgb = rgb
+
+    # Calculate Delta E from baseline (T=0)
+    base_l, base_a, base_b = lab_series[0]
+    delta_e = []
+    for l, a, b in lab_series:
+        de = float(np.sqrt((l - base_l)**2 + (a - base_a)**2 + (b - base_b)**2))
+        delta_e.append(round(de, 2))
+
+    total_shift = delta_e[-1]
+    slope = round((delta_e[-1] - delta_e[0]) / 4.0, 2)
+
+    # Chemical Evaluation
+    r, g, b = final_rgb
+    is_blue = (b > r + 20) and (b > g)
+
+    if total_shift < 8.0 and not is_blue:
+        verdict = "NEGATIVE: UNREACTIVE BASELINE"
+        positive, is_dye = False, False
+    elif total_shift < 8.0 and is_blue:
+        # Liquid was blue from T=0 with near-zero transition
+        verdict = "ADULTERANT FLAGGED: STATIC DYE (dE/dt ≈ 0)"
+        positive, is_dye = False, True
+    elif total_shift >= 12.0 and is_blue:
+        verdict = "POSITIVE: COCAINE HCl (KINETIC TRANSITION CONFIRMED)"
+        positive, is_dye = True, False
     else:
-        assay_status = "UNREACTIVE / BASELINE"
-
-    # Draw diagnostic overlays on the output image
-    cv2.rectangle(calibrated, (225, 50), (375, 100), (0, 255, 0), 2)
-    cv2.circle(calibrated, (300, 300), 75, (255, 0, 0), 2)
-
-    _, enc = cv2.imencode('.jpg', calibrated)
-    b64_img = "data:image/jpeg;base64," + base64.b64encode(enc).decode('utf-8')
+        verdict = f"ANOMALOUS REACTION (dE: {total_shift})"
+        positive, is_dye = False, False
 
     return jsonify({
         'success': True,
-        'ids': [0, 1, 2, 3],
-        'gains': {
-            'r': f"{gain_r:.2f}",
-            'g': f"{gain_g:.2f}",
-            'b': f"{gain_b:.2f}"
-        },
-        'rgb': {'r': well_r, 'g': well_g, 'b': well_b},
-        'assay_result': assay_status,
-        'rectified_image': b64_img
+        'delta_e_series': delta_e,
+        'slope': f"{slope}/s",
+        'final_rgb': {'r': r, 'g': g, 'b': b},
+        'verdict': verdict,
+        'positive': positive,
+        'is_dye': is_dye
     })
 
 if __name__ == '__main__':
