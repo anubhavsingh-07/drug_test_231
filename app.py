@@ -4,7 +4,9 @@ import numpy as np
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024  # 8MB payload limit to prevent OOM
 
+# ArUco Setup (4x4, 1000 markers)
 ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)
 try:
     DETECTOR = cv2.aruco.ArucoDetector(ARUCO_DICT, cv2.aruco.DetectorParameters())
@@ -19,7 +21,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>NDPS Field Assay System</title>
+    <title>NDPS Field Assay Calibration</title>
     <style>
         :root {
             --bg: #090a0f;
@@ -30,6 +32,7 @@ HTML_TEMPLATE = """
             --accent: #2e66ff;
             --success: #00b86b;
             --danger: #e63946;
+            --warning: #f59e0b;
             --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
             --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
@@ -89,8 +92,8 @@ HTML_TEMPLATE = """
 
         .overlay-box {
             position: absolute;
-            inset: 15%;
-            border: 1px dashed rgba(255, 255, 255, 0.3);
+            inset: 12%;
+            border: 1px dashed rgba(255, 255, 255, 0.35);
             pointer-events: none;
             display: flex;
             align-items: center;
@@ -157,7 +160,7 @@ HTML_TEMPLATE = """
 
         svg {
             width: 100%;
-            height: 120px;
+            height: 110px;
             background: #0d0f17;
             border: 1px solid var(--border);
         }
@@ -212,7 +215,8 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <canvas id="offscreenCanvas" width="640" height="640" style="display:none;"></canvas>
+    <!-- Client-side downscaler to optimize latency on free hosting -->
+    <canvas id="offscreenCanvas" width="480" height="480" style="display:none;"></canvas>
 
     <script>
         const video = document.getElementById('webcam');
@@ -228,7 +232,7 @@ HTML_TEMPLATE = """
         }).then(stream => {
             video.srcObject = stream;
         }).catch(err => {
-            alert("Camera access denied or unavailable.");
+            alert("Camera access unavailable or blocked.");
         });
 
         recordBtn.addEventListener('click', async () => {
@@ -238,8 +242,8 @@ HTML_TEMPLATE = """
             const frames = [];
             for (let i = 0; i < 5; i++) {
                 recordBtn.innerText = `SAMPLING REACTION (${i + 1}/5)...`;
-                ctx.drawImage(video, 0, 0, 640, 640);
-                frames.push(canvas.toDataURL('image/jpeg', 0.7));
+                ctx.drawImage(video, 0, 0, 480, 480);
+                frames.push(canvas.toDataURL('image/jpeg', 0.6));
                 if (i < 4) await new Promise(r => setTimeout(r, 1000));
             }
 
@@ -259,11 +263,17 @@ HTML_TEMPLATE = """
 
                 if (data.success) {
                     statusText.innerText = data.verdict;
-                    statusText.style.color = data.positive ? 'var(--success)' : (data.is_dye ? 'var(--danger)' : 'var(--text-secondary)');
+                    if (data.positive) {
+                        statusText.style.color = 'var(--success)';
+                    } else if (data.is_dye) {
+                        statusText.style.color = 'var(--danger)';
+                    } else {
+                        statusText.style.color = 'var(--warning)';
+                    }
+
                     document.getElementById('rateVal').innerText = data.slope;
                     document.getElementById('rgbVal').innerText = `(${data.final_rgb.r}, ${data.final_rgb.g}, ${data.final_rgb.b})`;
 
-                    // Render SVG kinetic points: scale x [0..4] to [40..270], y [0..max_de] to [80..20]
                     const maxDe = Math.max(...data.delta_e_series, 50);
                     const pts = data.delta_e_series.map((val, idx) => {
                         const x = 40 + (idx * 55);
@@ -271,7 +281,7 @@ HTML_TEMPLATE = """
                         return `${x},${y}`;
                     }).join(' ');
                     curve.setAttribute('points', pts);
-                    curve.setAttribute('stroke', data.positive ? '#00b86b' : (data.is_dye ? '#e63946' : '#2e66ff'));
+                    curve.setAttribute('stroke', data.positive ? '#00b86b' : (data.is_dye ? '#e63946' : '#f59e0b'));
                 } else {
                     statusText.innerText = "LOCK FAILED: " + data.message;
                     statusText.style.color = 'var(--danger)';
@@ -288,10 +298,17 @@ HTML_TEMPLATE = """
 </html>
 """
 
-def extract_well_lab(frame_b64):
-    header, encoded = frame_b64.split(",", 1)
-    file_bytes = np.frombuffer(base64.b64decode(encoded), np.uint8)
-    frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+def extract_well_data(frame_b64):
+    try:
+        if "," in frame_b64:
+            _, encoded = frame_b64.split(",", 1)
+        else:
+            encoded = frame_b64
+        file_bytes = np.frombuffer(base64.b64decode(encoded), np.uint8)
+        frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    except Exception:
+        return None, None
+
     if frame is None:
         return None, None
 
@@ -320,7 +337,7 @@ def extract_well_lab(frame_b64):
     matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
     warped = cv2.warpPerspective(frame, matrix, (SIZE, SIZE))
 
-    # Optical gray patch calibration
+    # Calibration against 18% gray patch
     gray_roi = warped[40:110, 220:380]
     b_mean = max(float(np.mean(gray_roi[:, :, 0])), 1.0)
     g_mean = max(float(np.mean(gray_roi[:, :, 1])), 1.0)
@@ -333,12 +350,16 @@ def extract_well_lab(frame_b64):
     calibrated[:, :, 2] = np.clip(calibrated[:, :, 2] * (TARGET / r_mean), 0, 255)
     calibrated = calibrated.astype(np.uint8)
 
-    # Reaction well sampling: center is at x:300, y:300, sample 100x100 box
-    well = calibrated[250:350, 250:350]
+    # Concentrated median sampling (30x30 px box around center [300, 300])
+    well = calibrated[285:315, 285:315]
     lab_well = cv2.cvtColor(well, cv2.COLOR_BGR2LAB)
     
-    avg_lab = np.mean(lab_well, axis=(0, 1))
-    avg_rgb = [int(np.mean(well[:, :, 2])), int(np.mean(well[:, :, 1])), int(np.mean(well[:, :, 0]))]
+    avg_lab = np.median(lab_well, axis=(0, 1))
+    avg_rgb = [
+        int(np.median(well[:, :, 2])),  # R
+        int(np.median(well[:, :, 1])),  # G
+        int(np.median(well[:, :, 0]))   # B
+    ]
     return avg_lab, avg_rgb
 
 @app.route('/')
@@ -351,19 +372,19 @@ def kinetic_assay():
     frames = data.get('frames', [])
 
     if len(frames) != 5:
-        return jsonify({'success': False, 'message': 'Requires exactly 5 temporal frames.'})
+        return jsonify({'success': False, 'message': 'Assay requires 5 temporal samples.'})
 
     lab_series = []
     final_rgb = [0, 0, 0]
 
     for frame_b64 in frames:
-        lab, rgb = extract_well_lab(frame_b64)
+        lab, rgb = extract_well_data(frame_b64)
         if lab is None:
-            return jsonify({'success': False, 'message': 'Card tracking lost during 5s burst. Keep frame stable.'})
+            return jsonify({'success': False, 'message': 'Card tracking lost during burst. Keep all 4 markers visible.'})
         lab_series.append(lab)
         final_rgb = rgb
 
-    # Calculate Delta E from baseline (T=0)
+    # Delta E relative to T=0 baseline
     base_l, base_a, base_b = lab_series[0]
     delta_e = []
     for l, a, b in lab_series:
@@ -373,22 +394,37 @@ def kinetic_assay():
     total_shift = delta_e[-1]
     slope = round((delta_e[-1] - delta_e[0]) / 4.0, 2)
 
-    # Chemical Evaluation
     r, g, b = final_rgb
-    is_blue = (b > r + 20) and (b > g)
 
-    if total_shift < 8.0 and not is_blue:
-        verdict = "NEGATIVE: UNREACTIVE BASELINE"
-        positive, is_dye = False, False
-    elif total_shift < 8.0 and is_blue:
-        # Liquid was blue from T=0 with near-zero transition
-        verdict = "ADULTERANT FLAGGED: STATIC DYE (dE/dt ≈ 0)"
-        positive, is_dye = False, True
-    elif total_shift >= 12.0 and is_blue:
-        verdict = "POSITIVE: COCAINE HCl (KINETIC TRANSITION CONFIRMED)"
-        positive, is_dye = True, False
+    # Multi-Analyte Optical Profiles
+    is_cocaine = (r <= 25) and (b >= 115) and (b > g + 20)
+    is_opiate = (r >= 65) and (b >= 80) and (g <= 75) and (r > g) and (b > g)
+    is_cyan = (r >= 35) and (b >= 105) and (g >= 80)
+
+    # Forensic Decision Engine
+    if total_shift < 8.0:
+        if is_cocaine or is_opiate or is_cyan:
+            verdict = "ADULTERANT FLAGGED: STATIC DYE (TAMPER DETECTED, dE/dt ≈ 0)"
+            positive, is_dye = False, True
+        else:
+            verdict = "NEGATIVE: UNREACTIVE BASELINE"
+            positive, is_dye = False, False
+
+    elif total_shift >= 12.0:
+        if is_cocaine:
+            verdict = "POSITIVE: COCAINE HCl (SCOTT REAGENT CONFIRMED)"
+            positive, is_dye = True, False
+        elif is_opiate:
+            verdict = "POSITIVE: OPIATES / HEROIN (MARQUIS REAGENT CONFIRMED)"
+            positive, is_dye = True, False
+        elif is_cyan:
+            verdict = "ADULTERANT INTERFERENCE: CYAN DYE (NON-COCAINE)"
+            positive, is_dye = False, True
+        else:
+            verdict = f"ANOMALOUS COLOR SPECTRUM (dE: {total_shift})"
+            positive, is_dye = False, False
     else:
-        verdict = f"ANOMALOUS REACTION (dE: {total_shift})"
+        verdict = f"INCONCLUSIVE KINETIC SHIFT (dE: {total_shift})"
         positive, is_dye = False, False
 
     return jsonify({
