@@ -7,9 +7,10 @@ import numpy as np
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB safety cap
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB memory safety cap
+app.config['DEBUG'] = False
 
-# ArUco Configuration
+# ArUco Configuration (DICT_4X4_1000)
 ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)
 try:
     DETECTOR = cv2.aruco.ArucoDetector(ARUCO_DICT, cv2.aruco.DetectorParameters())
@@ -84,7 +85,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>NDPS Forensic Field Assay</title>
+    <title>NDPS Forensic Field Assay Terminal</title>
     <style>
         :root {
             --bg: #0b0c10;
@@ -267,6 +268,7 @@ HTML_TEMPLATE = """
             font-size: 10px;
             line-height: 1.4;
             color: #b0b8c8;
+            margin-top: 8px;
         }
 
         .memo-header {
@@ -285,6 +287,37 @@ HTML_TEMPLATE = """
             padding: 4px;
             border: 1px solid #1a1e2a;
             margin-top: 4px;
+        }
+
+        .print-btn {
+            margin-top: 10px;
+            width: 100%;
+            padding: 9px;
+            background: #1b2030;
+            color: #fff;
+            border: 1px solid var(--border);
+            font-family: var(--font-mono);
+            font-size: 10px;
+            font-weight: 600;
+            cursor: pointer;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        @media print {
+            body { background: #fff !important; color: #000 !important; padding: 0 !important; }
+            .viewport-wrapper, header, .controls, #recordBtn, #graph, .data-list, button { display: none !important; }
+            #panel { display: block !important; border: none !important; background: #fff !important; padding: 0 !important; }
+            #memoBox {
+                display: block !important;
+                border: 2px solid #000 !important;
+                color: #000 !important;
+                background: #fff !important;
+                padding: 15px !important;
+            }
+            .memo-header { color: #000 !important; border-bottom: 2px solid #000 !important; font-size: 12pt !important; }
+            .memo-hash { color: #000 !important; background: #eee !important; border: 1px solid #666 !important; font-size: 8pt !important; }
+            .status { color: #000 !important; border-bottom: 2px solid #000 !important; font-size: 11pt !important; margin-bottom: 10px !important; }
         }
     </style>
 </head>
@@ -336,11 +369,15 @@ HTML_TEMPLATE = """
                 <div class="memo-header">Sec 52A Digital Seizure Hash Certificate</div>
                 <div>REAGENT: <span id="mReagent">--</span></div>
                 <div>ANALYTE: <span id="mAnalyte">--</span></div>
-                <div>GEO-COORDINATES: <span id="mGps">Fetching GNSS...</span></div>
-                <div>TIMESTAMP (UTC): <span id="mTime">--</span></div>
+                <div>GEO-COORDINATES: <span id="mGps">Acquiring GNSS...</span></div>
+                <div>TIMESTAMP (OFFICIAL): <span id="mTime">--</span></div>
                 <div>IO / STATION ID: <span>NCB-ZU-NDLS / GD-8821</span></div>
-                <div style="margin-top:6px;">CRYPTOGRAPHIC INTEGRITY SEAL (SHA-256):</div>
+                <div style="margin-top:6px;">CRYPTOGRAPHIC INTEGRITY SEAL (BSA SEC 63 / SHA-256):</div>
                 <div id="mHash" class="memo-hash">--</div>
+
+                <button class="print-btn" onclick="window.print()">
+                    Export / Print Official Seizure Memo (PDF)
+                </button>
             </div>
         </div>
     </div>
@@ -361,7 +398,7 @@ HTML_TEMPLATE = """
         let currentLat = "30.3165 N";
         let currentLng = "78.0322 E";
 
-        // Query GNSS coordinates automatically
+        // Query GNSS coordinates automatically from device sensor
         if (navigator.geolocation) {
             navigator.geolocation.getCurrentPosition(pos => {
                 currentLat = pos.coords.latitude.toFixed(5);
@@ -374,7 +411,7 @@ HTML_TEMPLATE = """
         }).then(stream => {
             video.srcObject = stream;
         }).catch(() => {
-            alert("Rear camera feed unavailable or blocked.");
+            alert("Rear camera access unavailable or blocked.");
         });
 
         recordBtn.addEventListener('click', async () => {
@@ -383,8 +420,7 @@ HTML_TEMPLATE = """
             panel.style.display = 'none';
             memoBox.style.display = 'none';
 
-            // Pacing: calculate sampling delay so 5 frames span the designated reaction window
-            // For live demos (Scott 5s), delay is ~1000ms. For longer tests, it scales proportionally.
+            // Pacing delay so 5 frames span the designated reaction window
             const delays = {
                 "scott_cocaine": 1000,
                 "marquis_opiate": 2000,
@@ -561,7 +597,7 @@ def kinetic_assay():
     total_shift = delta_e[-1]
     slope = round((delta_e[-1] - delta_e[0]) / 4.0, 2)
 
-        # 2. Objective distance to certified standard in CIE-Lab space
+    # 2. Objective Euclidean distance to certified standard in CIE-Lab space
     cur_l, cur_a, cur_b = lab_series[-1]
     tgt_l, tgt_a, tgt_b = cfg['target_lab']
     delta_e_ref = float(np.sqrt((cur_l - tgt_l)**2 + (cur_a - tgt_a)**2 + (cur_b - tgt_b)**2))
@@ -571,7 +607,7 @@ def kinetic_assay():
     # 3. Decision Matrix
     if total_shift < 8.0:
         if color_matches_target:
-            verdict = f"ADULTERANT FLAGGED: STATIC PRE-EXISTING DYE (dE/dt ≈ 0)"
+            verdict = "ADULTERANT FLAGGED: STATIC PRE-EXISTING DYE (dE/dt ≈ 0)"
             positive, is_dye = False, True
         else:
             verdict = "NEGATIVE: UNREACTIVE BASELINE"
@@ -592,7 +628,12 @@ def kinetic_assay():
     _, enc_bytes = cv2.imencode('.png', final_calibrated_frame)
     sha256_hash = hashlib.sha256(enc_bytes).hexdigest()
 
-    timestamp_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    # Format official IST time for Indian policing, with UTC ISO standard
+    now_utc = datetime.now(timezone.utc)
+    now_ist = datetime.fromtimestamp(now_utc.timestamp() + 19800, timezone.utc)
+    
+    timestamp_ist = now_ist.strftime("%d-%m-%Y %H:%M:%S IST")
+    timestamp_utc = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
     return jsonify({
         'success': True,
@@ -608,11 +649,10 @@ def kinetic_assay():
             'analyte': cfg['analyte'],
             'lat': lat,
             'lng': lng,
-            'timestamp': timestamp_iso,
+            'timestamp': f"{timestamp_ist} ({timestamp_utc})",
             'sha256_seal': sha256_hash
         }
     })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
-    
