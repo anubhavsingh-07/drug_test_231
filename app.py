@@ -7,16 +7,30 @@ import numpy as np
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB memory safety cap
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB payload ceiling
 app.config['DEBUG'] = False
 
-# ArUco Configuration (DICT_4X4_1000)
+# Glare-Resistant ArUco Detector Configuration (4x4, 1000 markers)
 ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)
+
+if hasattr(cv2.aruco, 'DetectorParameters'):
+    ARUCO_PARAMS = cv2.aruco.DetectorParameters()
+else:
+    ARUCO_PARAMS = cv2.aruco.DetectorParameters_create()
+
+# Dynamic thresholding parameters to bypass specular reflections and light flares
+ARUCO_PARAMS.adaptiveThreshWinSizeMin = 3
+ARUCO_PARAMS.adaptiveThreshWinSizeMax = 45
+ARUCO_PARAMS.adaptiveThreshWinSizeStep = 4
+ARUCO_PARAMS.adaptiveThreshConstant = 7
+ARUCO_PARAMS.minMarkerPerimeterRate = 0.03
+if hasattr(cv2.aruco, 'CORNER_REFINE_SUBPIX'):
+    ARUCO_PARAMS.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+
 try:
-    DETECTOR = cv2.aruco.ArucoDetector(ARUCO_DICT, cv2.aruco.DetectorParameters())
+    DETECTOR = cv2.aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
     USE_NEW_API = True
 except AttributeError:
-    PARAMS = cv2.aruco.DetectorParameters_create()
     USE_NEW_API = False
 
 # Certified UNODC / CRCL Reagent Registry
@@ -26,15 +40,15 @@ REAGENT_DATABASE = {
         "analyte": "Cocaine HCl",
         "duration_sec": 5,
         "target_lab": [82.0, 152.0, 69.0],  # Cobalt Blue (#0047AB)
-        "tolerance_de": 32.0,
-        "ndps_schedule": "Schedule I (Commercial / Small)"
+        "tolerance_de": 42.0,  # Adjusted to accommodate ambient room reflections
+        "ndps_schedule": "Schedule I (Commercial / Small Quantity)"
     },
     "marquis_opiate": {
         "name": "Marquis Reagent",
         "analyte": "Opiates (Heroin / Morphine)",
         "duration_sec": 10,
         "target_lab": [75.0, 148.0, 115.0],  # Deep Violet (#4B0082)
-        "tolerance_de": 35.0,
+        "tolerance_de": 38.0,
         "ndps_schedule": "Schedule I"
     },
     "simons_mdma": {
@@ -42,7 +56,7 @@ REAGENT_DATABASE = {
         "analyte": "MDMA / Methamphetamine",
         "duration_sec": 10,
         "target_lab": [88.0, 135.0, 72.0],  # Royal Blue
-        "tolerance_de": 30.0,
+        "tolerance_de": 32.0,
         "ndps_schedule": "Schedule I / II"
     },
     "marquis_amphet": {
@@ -50,7 +64,7 @@ REAGENT_DATABASE = {
         "analyte": "Amphetamine Class",
         "duration_sec": 15,
         "target_lab": [110.0, 145.0, 165.0],  # Orange-Brown
-        "tolerance_de": 30.0,
+        "tolerance_de": 32.0,
         "ndps_schedule": "Schedule II"
     },
     "mandelin_ketamine": {
@@ -58,7 +72,7 @@ REAGENT_DATABASE = {
         "analyte": "Ketamine HCl",
         "duration_sec": 20,
         "target_lab": [90.0, 115.0, 140.0],  # Olive-Brown
-        "tolerance_de": 30.0,
+        "tolerance_de": 32.0,
         "ndps_schedule": "Schedule I"
     },
     "duquenois_cannabis": {
@@ -66,7 +80,7 @@ REAGENT_DATABASE = {
         "analyte": "Cannabinoids (THC / Charas)",
         "duration_sec": 30,
         "target_lab": [70.0, 150.0, 120.0],  # Violet-Indigo Layer
-        "tolerance_de": 35.0,
+        "tolerance_de": 36.0,
         "ndps_schedule": "Schedule III"
     },
     "ehrlich_lsd": {
@@ -74,7 +88,7 @@ REAGENT_DATABASE = {
         "analyte": "LSD / Indole Alkaloids",
         "duration_sec": 45,
         "target_lab": [78.0, 142.0, 90.0],  # Deep Purple
-        "tolerance_de": 35.0,
+        "tolerance_de": 36.0,
         "ndps_schedule": "Schedule I"
     }
 }
@@ -85,7 +99,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>NDPS Forensic Field Assay Terminal</title>
+    <title>NDPS Field Colorimetric Terminal</title>
     <style>
         :root {
             --bg: #0b0c10;
@@ -258,15 +272,14 @@ HTML_TEMPLATE = """
             font-weight: 600;
         }
 
-        /* Seizure Certificate Section */
         #memoBox {
             display: none;
             background: #07080a;
             border: 1px solid var(--border);
-            padding: 10px;
+            padding: 12px;
             font-family: var(--font-mono);
             font-size: 10px;
-            line-height: 1.4;
+            line-height: 1.45;
             color: #b0b8c8;
             margin-top: 8px;
         }
@@ -284,7 +297,7 @@ HTML_TEMPLATE = """
             word-break: break-all;
             color: #4da6ff;
             background: #11131a;
-            padding: 4px;
+            padding: 5px;
             border: 1px solid #1a1e2a;
             margin-top: 4px;
         }
@@ -382,6 +395,7 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
+    <!-- Offscreen canvas downscaled to 480x480 to preserve cloud memory -->
     <canvas id="offscreenCanvas" width="480" height="480" style="display:none;"></canvas>
 
     <script>
@@ -398,20 +412,21 @@ HTML_TEMPLATE = """
         let currentLat = "30.3165 N";
         let currentLng = "78.0322 E";
 
-        // Query GNSS coordinates automatically from device sensor
-        if (navigator.geolocation) {
-            navigator.geolocation.getCurrentPosition(pos => {
-                currentLat = pos.coords.latitude.toFixed(5);
-                currentLng = pos.coords.longitude.toFixed(5);
-            }, () => {});
-        }
-
+        // Sequentially initialize camera first, then query location to prevent Android permission overlay collision
         navigator.mediaDevices.getUserMedia({
             video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 1280 } }
         }).then(stream => {
             video.srcObject = stream;
+            setTimeout(() => {
+                if (navigator.geolocation) {
+                    navigator.geolocation.getCurrentPosition(pos => {
+                        currentLat = pos.coords.latitude.toFixed(5);
+                        currentLng = pos.coords.longitude.toFixed(5);
+                    }, () => {});
+                }
+            }, 1200);
         }).catch(() => {
-            alert("Rear camera access unavailable or blocked.");
+            alert("Rear camera feed unavailable or permissions blocked.");
         });
 
         recordBtn.addEventListener('click', async () => {
@@ -420,7 +435,7 @@ HTML_TEMPLATE = """
             panel.style.display = 'none';
             memoBox.style.display = 'none';
 
-            // Pacing delay so 5 frames span the designated reaction window
+            // Pacing delay to distribute 5 samples across target duration
             const delays = {
                 "scott_cocaine": 1000,
                 "marquis_opiate": 2000,
@@ -510,10 +525,15 @@ def extract_well_data(frame_b64):
         return None, None, None
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Apply CLAHE to resolve marker borders through glare and reflections
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    gray_boosted = clahe.apply(gray)
+
     if USE_NEW_API:
-        corners, ids, _ = DETECTOR.detectMarkers(frame)
+        corners, ids, _ = DETECTOR.detectMarkers(gray_boosted)
     else:
-        corners, ids, _ = cv2.aruco.detectMarkers(gray, ARUCO_DICT, parameters=PARAMS)
+        corners, ids, _ = cv2.aruco.detectMarkers(gray_boosted, ARUCO_DICT, parameters=ARUCO_PARAMS)
 
     if ids is None or len(ids) < 4:
         return None, None, None
@@ -547,16 +567,31 @@ def extract_well_data(frame_b64):
     calibrated[:, :, 2] = np.clip(calibrated[:, :, 2] * (TARGET / r_mean), 0, 255)
     calibrated = calibrated.astype(np.uint8)
 
-    # Concentrated median sampling (30x30 px box in exact center)
+    # Concentrated median sampling in center (30x30 px box)
     well = calibrated[285:315, 285:315]
-    lab_well = cv2.cvtColor(well, cv2.COLOR_BGR2LAB)
     
-    avg_lab = np.median(lab_well, axis=(0, 1))
-    avg_rgb = [
-        int(np.median(well[:, :, 2])),
-        int(np.median(well[:, :, 1])),
-        int(np.median(well[:, :, 0]))
-    ]
+    # Filter specular glare reflections (> 220 in all channels)
+    glare_mask = cv2.inRange(well, np.array([220, 220, 220]), np.array([255, 255, 255]))
+    non_glare = well[glare_mask == 0]
+
+    if len(non_glare) > 30:
+        sample_bgr = non_glare.reshape(-1, 1, 3)
+        sample_lab = cv2.cvtColor(sample_bgr, cv2.COLOR_BGR2LAB)
+        avg_lab = np.median(sample_lab, axis=0)[0]
+        avg_rgb = [
+            int(np.median(non_glare[:, 2])),
+            int(np.median(non_glare[:, 1])),
+            int(np.median(non_glare[:, 0]))
+        ]
+    else:
+        lab_well = cv2.cvtColor(well, cv2.COLOR_BGR2LAB)
+        avg_lab = np.median(lab_well, axis=(0, 1))
+        avg_rgb = [
+            int(np.median(well[:, :, 2])),
+            int(np.median(well[:, :, 1])),
+            int(np.median(well[:, :, 0]))
+        ]
+
     return avg_lab, avg_rgb, calibrated
 
 @app.route('/')
@@ -628,7 +663,7 @@ def kinetic_assay():
     _, enc_bytes = cv2.imencode('.png', final_calibrated_frame)
     sha256_hash = hashlib.sha256(enc_bytes).hexdigest()
 
-    # Format official IST time for Indian policing, with UTC ISO standard
+    # Format official IST time for Indian policing, along with UTC ISO standard
     now_utc = datetime.now(timezone.utc)
     now_ist = datetime.fromtimestamp(now_utc.timestamp() + 19800, timezone.utc)
     
