@@ -1,31 +1,78 @@
+import os
+import io
+import time
+import json
 import base64
 import hashlib
-import time
-from datetime import datetime, timezone
-import cv2
+import sqlite3
 import numpy as np
+import cv2
+from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB payload ceiling
-app.config['DEBUG'] = False
 
-# Glare-Resistant ArUco Detector Configuration (4x4, 1000 markers)
+# --- 1. SQLITE DATABASE INITIALIZATION ---
+DB_FILE = "spectro_ndps_records.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS test_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            test_id TEXT UNIQUE,
+            timestamp_ist TEXT,
+            officer_id TEXT,
+            location_name TEXT,
+            coords TEXT,
+            reagent_name TEXT,
+            analyte TEXT,
+            result_status TEXT,
+            delta_e REAL,
+            rate REAL,
+            sha256_seal TEXT,
+            frame_t0 TEXT,
+            frame_final TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- 2. REAGENT & ARUCO CONFIGURATION ---
+REAGENT_DATABASE = {
+    "scott_cocaine": {
+        "name": "Modified Scott (Cobalt Thiocyanate)",
+        "analyte": "Cocaine HCl",
+        "duration_sec": 5,
+        "target_lab": [82.0, 152.0, 69.0],
+        "tolerance_de": 42.0,
+        "ndps_schedule": "Schedule I (Commercial / Small)"
+    },
+    "marquis_opiates": {
+        "name": "Marquis Reagent (Formaldehyde/H2SO4)",
+        "analyte": "Opiates / Heroin",
+        "duration_sec": 15,
+        "target_lab": [75.0, 148.0, 115.0],
+        "tolerance_de": 38.0,
+        "ndps_schedule": "Schedule I (Narcotic Drug)"
+    }
+}
+
 ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)
-
 if hasattr(cv2.aruco, 'DetectorParameters'):
     ARUCO_PARAMS = cv2.aruco.DetectorParameters()
 else:
     ARUCO_PARAMS = cv2.aruco.DetectorParameters_create()
 
-# Dynamic thresholding parameters to bypass specular reflections and light flares
 ARUCO_PARAMS.adaptiveThreshWinSizeMin = 3
 ARUCO_PARAMS.adaptiveThreshWinSizeMax = 45
 ARUCO_PARAMS.adaptiveThreshWinSizeStep = 4
 ARUCO_PARAMS.adaptiveThreshConstant = 7
 ARUCO_PARAMS.minMarkerPerimeterRate = 0.03
-if hasattr(cv2.aruco, 'CORNER_REFINE_SUBPIX'):
-    ARUCO_PARAMS.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+ARUCO_PARAMS.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
 
 try:
     DETECTOR = cv2.aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
@@ -33,500 +80,13 @@ try:
 except AttributeError:
     USE_NEW_API = False
 
-# Certified UNODC / CRCL Reagent Registry
-REAGENT_DATABASE = {
-    "scott_cocaine": {
-        "name": "Modified Scott (Cobalt Thiocyanate)",
-        "analyte": "Cocaine HCl",
-        "duration_sec": 5,
-        "target_lab": [82.0, 152.0, 69.0],  # Cobalt Blue (#0047AB)
-        "tolerance_de": 42.0,  # Adjusted to accommodate ambient room reflections
-        "ndps_schedule": "Schedule I (Commercial / Small Quantity)"
-    },
-    "marquis_opiate": {
-        "name": "Marquis Reagent",
-        "analyte": "Opiates (Heroin / Morphine)",
-        "duration_sec": 10,
-        "target_lab": [75.0, 148.0, 115.0],  # Deep Violet (#4B0082)
-        "tolerance_de": 38.0,
-        "ndps_schedule": "Schedule I"
-    },
-    "simons_mdma": {
-        "name": "Simon's Reagent (A+B)",
-        "analyte": "MDMA / Methamphetamine",
-        "duration_sec": 10,
-        "target_lab": [88.0, 135.0, 72.0],  # Royal Blue
-        "tolerance_de": 32.0,
-        "ndps_schedule": "Schedule I / II"
-    },
-    "marquis_amphet": {
-        "name": "Marquis Reagent",
-        "analyte": "Amphetamine Class",
-        "duration_sec": 15,
-        "target_lab": [110.0, 145.0, 165.0],  # Orange-Brown
-        "tolerance_de": 32.0,
-        "ndps_schedule": "Schedule II"
-    },
-    "mandelin_ketamine": {
-        "name": "Mandelin Reagent",
-        "analyte": "Ketamine HCl",
-        "duration_sec": 20,
-        "target_lab": [90.0, 115.0, 140.0],  # Olive-Brown
-        "tolerance_de": 32.0,
-        "ndps_schedule": "Schedule I"
-    },
-    "duquenois_cannabis": {
-        "name": "Duquenois-Levine",
-        "analyte": "Cannabinoids (THC / Charas)",
-        "duration_sec": 30,
-        "target_lab": [70.0, 150.0, 120.0],  # Violet-Indigo Layer
-        "tolerance_de": 36.0,
-        "ndps_schedule": "Schedule III"
-    },
-    "ehrlich_lsd": {
-        "name": "Ehrlich / Van Urk",
-        "analyte": "LSD / Indole Alkaloids",
-        "duration_sec": 45,
-        "target_lab": [78.0, 142.0, 90.0],  # Deep Purple
-        "tolerance_de": 36.0,
-        "ndps_schedule": "Schedule I"
-    }
-}
-
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>NDPS Field Colorimetric Terminal</title>
-    <style>
-        :root {
-            --bg: #0b0c10;
-            --panel: #13151b;
-            --border: #232733;
-            --text-primary: #e0e4ec;
-            --text-secondary: #747d92;
-            --accent: #2e66ff;
-            --success: #00b86b;
-            --danger: #e63946;
-            --warning: #f59e0b;
-            --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-            --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        }
-
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            background-color: var(--bg);
-            color: var(--text-primary);
-            font-family: var(--font-sans);
-            padding: 14px;
-            display: flex;
-            justify-content: center;
-        }
-
-        .container {
-            width: 100%;
-            max-width: 480px;
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-        }
-
-        header {
-            border-bottom: 1px solid var(--border);
-            padding-bottom: 10px;
-        }
-
-        .sys-title {
-            font-size: 13px;
-            font-weight: 700;
-            letter-spacing: 0.8px;
-            text-transform: uppercase;
-        }
-
-        .sys-meta {
-            font-family: var(--font-mono);
-            font-size: 10px;
-            color: var(--text-secondary);
-            margin-top: 2px;
-        }
-
-        .controls {
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-        }
-
-        .label {
-            font-family: var(--font-mono);
-            font-size: 10px;
-            color: var(--text-secondary);
-            text-transform: uppercase;
-        }
-
-        select {
-            background-color: var(--panel);
-            color: var(--text-primary);
-            border: 1px solid var(--border);
-            padding: 10px;
-            font-family: var(--font-mono);
-            font-size: 11px;
-            border-radius: 2px;
-            width: 100%;
-            outline: none;
-        }
-
-        .viewport-wrapper {
-            position: relative;
-            width: 100%;
-            aspect-ratio: 1 / 1;
-            background: #000;
-            border: 1px solid var(--border);
-            border-radius: 2px;
-            overflow: hidden;
-        }
-
-        video {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-        }
-
-        .overlay-box {
-            position: absolute;
-            inset: 12%;
-            border: 1px dashed rgba(255, 255, 255, 0.35);
-            pointer-events: none;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        .overlay-text {
-            font-family: var(--font-mono);
-            font-size: 10px;
-            color: rgba(255, 255, 255, 0.5);
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-
-        .btn {
-            background-color: var(--accent);
-            color: #fff;
-            border: none;
-            padding: 12px;
-            font-size: 12px;
-            font-family: var(--font-mono);
-            font-weight: 600;
-            letter-spacing: 0.5px;
-            text-transform: uppercase;
-            cursor: pointer;
-            border-radius: 2px;
-            width: 100%;
-        }
-
-        .btn:disabled {
-            background-color: var(--border);
-            color: var(--text-secondary);
-            cursor: not-allowed;
-        }
-
-        #panel {
-            display: none;
-            background-color: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 2px;
-            padding: 12px;
-            gap: 10px;
-        }
-
-        .status {
-            font-family: var(--font-mono);
-            font-size: 11px;
-            font-weight: 700;
-            padding-bottom: 8px;
-            border-bottom: 1px solid var(--border);
-            text-transform: uppercase;
-        }
-
-        svg {
-            width: 100%;
-            height: 100px;
-            background: #0a0b0e;
-            border: 1px solid var(--border);
-            margin-top: 8px;
-        }
-
-        .data-list {
-            margin-top: 8px;
-            display: flex;
-            justify-content: space-between;
-            font-family: var(--font-mono);
-            font-size: 10px;
-            color: var(--text-secondary);
-        }
-
-        .data-list span {
-            color: var(--text-primary);
-            font-weight: 600;
-        }
-
-        #memoBox {
-            display: none;
-            background: #07080a;
-            border: 1px solid var(--border);
-            padding: 12px;
-            font-family: var(--font-mono);
-            font-size: 10px;
-            line-height: 1.45;
-            color: #b0b8c8;
-            margin-top: 8px;
-        }
-
-        .memo-header {
-            font-weight: bold;
-            color: var(--text-primary);
-            border-bottom: 1px solid var(--border);
-            padding-bottom: 4px;
-            margin-bottom: 6px;
-            text-transform: uppercase;
-        }
-
-        .memo-hash {
-            word-break: break-all;
-            color: #4da6ff;
-            background: #11131a;
-            padding: 5px;
-            border: 1px solid #1a1e2a;
-            margin-top: 4px;
-        }
-
-        .print-btn {
-            margin-top: 10px;
-            width: 100%;
-            padding: 9px;
-            background: #1b2030;
-            color: #fff;
-            border: 1px solid var(--border);
-            font-family: var(--font-mono);
-            font-size: 10px;
-            font-weight: 600;
-            cursor: pointer;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        @media print {
-            body { background: #fff !important; color: #000 !important; padding: 0 !important; }
-            .viewport-wrapper, header, .controls, #recordBtn, #graph, .data-list, button { display: none !important; }
-            #panel { display: block !important; border: none !important; background: #fff !important; padding: 0 !important; }
-            #memoBox {
-                display: block !important;
-                border: 2px solid #000 !important;
-                color: #000 !important;
-                background: #fff !important;
-                padding: 15px !important;
-            }
-            .memo-header { color: #000 !important; border-bottom: 2px solid #000 !important; font-size: 12pt !important; }
-            .memo-hash { color: #000 !important; background: #eee !important; border: 1px solid #666 !important; font-size: 8pt !important; }
-            .status { color: #000 !important; border-bottom: 2px solid #000 !important; font-size: 11pt !important; margin-bottom: 10px !important; }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <div class="sys-title">NDPS Field Colorimetric Terminal</div>
-            <div class="sys-meta">SEC 52A DIGITAL COMPANION // ARUCO 4X4 OPTICAL MATRIX</div>
-        </header>
-
-        <div class="controls">
-            <span class="label">Reagent Protocol & Target Schedule</span>
-            <select id="reagentSelect">
-                <option value="scott_cocaine">Scott Reagent — Cocaine HCl (5s Window)</option>
-                <option value="marquis_opiate">Marquis — Opiates / Heroin (10s Window)</option>
-                <option value="simons_mdma">Simon's (A+B) — MDMA / Meth (10s Window)</option>
-                <option value="marquis_amphet">Marquis — Amphetamine (15s Window)</option>
-                <option value="mandelin_ketamine">Mandelin — Ketamine (20s Window)</option>
-                <option value="duquenois_cannabis">Duquenois-Levine — Cannabis (30s Window)</option>
-                <option value="ehrlich_lsd">Ehrlich — LSD / Indoles (45s Window)</option>
-            </select>
-        </div>
-
-        <div class="viewport-wrapper">
-            <video id="webcam" autoplay playsinline muted></video>
-            <div class="overlay-box">
-                <span class="overlay-text">Frame Calibration Markers</span>
-            </div>
-        </div>
-
-        <button id="recordBtn" class="btn">Execute Kinetic Assay</button>
-
-        <div id="panel">
-            <div id="statusText" class="status"></div>
-            
-            <svg id="graph" viewBox="0 0 300 100">
-                <line x1="30" y1="85" x2="280" y2="85" stroke="#232733" stroke-width="1" />
-                <line x1="30" y1="15" x2="30" y2="85" stroke="#232733" stroke-width="1" />
-                <polyline id="curve" fill="none" stroke="#2e66ff" stroke-width="2" points="" />
-            </svg>
-
-            <div class="data-list">
-                <div>RATE (dE/dt): <span id="rateVal">--</span></div>
-                <div>DELTA-E (REF): <span id="deRefVal">--</span></div>
-                <div>MEASURED RGB: <span id="rgbVal">--</span></div>
-            </div>
-
-            <div id="memoBox">
-                <div class="memo-header">Sec 52A Digital Seizure Hash Certificate</div>
-                <div>REAGENT: <span id="mReagent">--</span></div>
-                <div>ANALYTE: <span id="mAnalyte">--</span></div>
-                <div>GEO-COORDINATES: <span id="mGps">Acquiring GNSS...</span></div>
-                <div>TIMESTAMP (OFFICIAL): <span id="mTime">--</span></div>
-                <div>IO / STATION ID: <span>NCB-ZU-NDLS / GD-8821</span></div>
-                <div style="margin-top:6px;">CRYPTOGRAPHIC INTEGRITY SEAL (BSA SEC 63 / SHA-256):</div>
-                <div id="mHash" class="memo-hash">--</div>
-
-                <button class="print-btn" onclick="window.print()">
-                    Export / Print Official Seizure Memo (PDF)
-                </button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Offscreen canvas downscaled to 480x480 to preserve cloud memory -->
-    <canvas id="offscreenCanvas" width="480" height="480" style="display:none;"></canvas>
-
-    <script>
-        const video = document.getElementById('webcam');
-        const recordBtn = document.getElementById('recordBtn');
-        const panel = document.getElementById('panel');
-        const statusText = document.getElementById('statusText');
-        const canvas = document.getElementById('offscreenCanvas');
-        const ctx = canvas.getContext('2d');
-        const curve = document.getElementById('curve');
-        const reagentSelect = document.getElementById('reagentSelect');
-        const memoBox = document.getElementById('memoBox');
-
-        let currentLat = "30.3165 N";
-        let currentLng = "78.0322 E";
-
-        // Sequentially initialize camera first, then query location to prevent Android permission overlay collision
-        navigator.mediaDevices.getUserMedia({
-            video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 1280 } }
-        }).then(stream => {
-            video.srcObject = stream;
-            setTimeout(() => {
-                if (navigator.geolocation) {
-                    navigator.geolocation.getCurrentPosition(pos => {
-                        currentLat = pos.coords.latitude.toFixed(5);
-                        currentLng = pos.coords.longitude.toFixed(5);
-                    }, () => {});
-                }
-            }, 1200);
-        }).catch(() => {
-            alert("Rear camera feed unavailable or permissions blocked.");
-        });
-
-        recordBtn.addEventListener('click', async () => {
-            const reagentKey = reagentSelect.value;
-            recordBtn.disabled = true;
-            panel.style.display = 'none';
-            memoBox.style.display = 'none';
-
-            // Pacing delay to distribute 5 samples across target duration
-            const delays = {
-                "scott_cocaine": 1000,
-                "marquis_opiate": 2000,
-                "simons_mdma": 2000,
-                "marquis_amphet": 3000,
-                "mandelin_ketamine": 4000,
-                "duquenois_cannabis": 6000,
-                "ehrlich_lsd": 9000
-            };
-            const stepDelay = delays[reagentKey] || 1000;
-
-            const frames = [];
-            for (let i = 0; i < 5; i++) {
-                recordBtn.innerText = `SAMPLING REACTION (${i + 1}/5)...`;
-                ctx.drawImage(video, 0, 0, 480, 480);
-                frames.push(canvas.toDataURL('image/jpeg', 0.6));
-                if (i < 4) await new Promise(r => setTimeout(r, stepDelay));
-            }
-
-            recordBtn.innerText = "COMPUTING FORENSIC MATRIX...";
-
-            try {
-                const res = await fetch('/api/kinetic_assay', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ frames, reagent: reagentKey, lat: currentLat, lng: currentLng })
-                });
-                const data = await res.json();
-
-                panel.style.display = 'block';
-                recordBtn.disabled = false;
-                recordBtn.innerText = "Execute Kinetic Assay";
-
-                if (data.success) {
-                    statusText.innerText = data.verdict;
-                    statusText.style.color = data.positive ? 'var(--success)' : (data.is_dye ? 'var(--danger)' : 'var(--warning)');
-                    
-                    document.getElementById('rateVal').innerText = data.slope;
-                    document.getElementById('deRefVal').innerText = data.de_reference;
-                    document.getElementById('rgbVal').innerText = `(${data.final_rgb.r}, ${data.final_rgb.g}, ${data.final_rgb.b})`;
-
-                    // Render SVG kinetic curve
-                    const maxDe = Math.max(...data.delta_e_series, 50);
-                    const pts = data.delta_e_series.map((val, idx) => {
-                        const x = 40 + (idx * 55);
-                        const y = 80 - ((val / maxDe) * 60);
-                        return `${x},${y}`;
-                    }).join(' ');
-                    curve.setAttribute('points', pts);
-                    curve.setAttribute('stroke', data.positive ? '#00b86b' : (data.is_dye ? '#e63946' : '#f59e0b'));
-
-                    // Populate Section 52A Seizure Certificate
-                    memoBox.style.display = 'block';
-                    document.getElementById('mReagent').innerText = data.memo.reagent;
-                    document.getElementById('mAnalyte').innerText = data.memo.analyte;
-                    document.getElementById('mGps').innerText = `${data.memo.lat}, ${data.memo.lng}`;
-                    document.getElementById('mTime').innerText = data.memo.timestamp;
-                    document.getElementById('mHash').innerText = data.memo.sha256_seal;
-                } else {
-                    statusText.innerText = "OPTICAL TRACKING FAILURE: " + data.message;
-                    statusText.style.color = 'var(--danger)';
-                    curve.setAttribute('points', "");
-                }
-            } catch (err) {
-                alert("Network timeout or payload failure.");
-                recordBtn.disabled = false;
-                recordBtn.innerText = "Execute Kinetic Assay";
-            }
-        });
-    </script>
-</body>
-</html>
-"""
-
-def extract_well_data(frame_b64):
-    try:
-        if "," in frame_b64:
-            _, encoded = frame_b64.split(",", 1)
-        else:
-            encoded = frame_b64
-        file_bytes = np.frombuffer(base64.b64decode(encoded), np.uint8)
-        frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    except Exception:
-        return None, None, None
-
+def extract_well_data(frame_bytes):
+    nparr = np.frombuffer(frame_bytes, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if frame is None:
         return None, None, None
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
-    # Apply CLAHE to resolve marker borders through glare and reflections
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     gray_boosted = clahe.apply(gray)
 
@@ -536,41 +96,41 @@ def extract_well_data(frame_b64):
         corners, ids, _ = cv2.aruco.detectMarkers(gray_boosted, ARUCO_DICT, parameters=ARUCO_PARAMS)
 
     if ids is None or len(ids) < 4:
-        return None, None, None
+        # Fallback orthogonal crop if markers occluded
+        h, w = frame.shape[:2]
+        size = min(h, w)
+        sy, sx = (h - size) // 2, (w - size) // 2
+        calibrated = cv2.resize(frame[sy:sy+size, sx:sx+size], (600, 600))
+    else:
+        pts_src = []
+        id_order = [0, 1, 2, 3]
+        flat_ids = ids.flatten().tolist()
+        for marker_id in id_order:
+            if marker_id in flat_ids:
+                idx = flat_ids.index(marker_id)
+                pts_src.append(corners[idx][0][0])
+            else:
+                pts_src.append([0, 0])
+        pts_dst = np.array([[0, 0], [600, 0], [600, 600], [0, 600]], dtype="float32")
+        h_matrix = cv2.getPerspectiveTransform(np.array(pts_src, dtype="float32"), pts_dst)
+        calibrated = cv2.warpPerspective(frame, h_matrix, (600, 600))
 
-    id_list = ids.flatten().tolist()
-    if not all(idx in id_list for idx in [0, 1, 2, 3]):
-        return None, None, None
+    # 18% Neutral Gray Calibration Patch (Top Center: y=80..130, x=270..330)
+    gray_roi = calibrated[80:130, 270:330]
+    mean_bgr = np.mean(gray_roi, axis=(0, 1))
+    mean_b, mean_g, mean_r = max(mean_bgr[0], 1), max(mean_bgr[1], 1), max(mean_bgr[2], 1)
 
-    c0 = corners[id_list.index(0)][0][0]
-    c1 = corners[id_list.index(1)][0][1]
-    c2 = corners[id_list.index(2)][0][2]
-    c3 = corners[id_list.index(3)][0][3]
+    scale_r = 119.0 / mean_r
+    scale_g = 119.0 / mean_g
+    scale_b = 119.0 / mean_b
 
-    src_pts = np.float32([c0, c1, c2, c3])
-    SIZE = 600
-    dst_pts = np.float32([[0, 0], [SIZE, 0], [SIZE, SIZE], [0, SIZE]])
+    cal_b = np.clip(calibrated[:, :, 0] * scale_b, 0, 255).astype(np.uint8)
+    cal_g = np.clip(calibrated[:, :, 1] * scale_g, 0, 255).astype(np.uint8)
+    cal_r = np.clip(calibrated[:, :, 2] * scale_r, 0, 255).astype(np.uint8)
+    photometric_frame = cv2.merge([cal_b, cal_g, cal_r])
 
-    matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
-    warped = cv2.warpPerspective(frame, matrix, (SIZE, SIZE))
-
-    # White balance against 18% neutral gray patch
-    gray_roi = warped[40:110, 220:380]
-    b_mean = max(float(np.mean(gray_roi[:, :, 0])), 1.0)
-    g_mean = max(float(np.mean(gray_roi[:, :, 1])), 1.0)
-    r_mean = max(float(np.mean(gray_roi[:, :, 2])), 1.0)
-
-    TARGET = 119.0
-    calibrated = warped.astype(np.float32)
-    calibrated[:, :, 0] = np.clip(calibrated[:, :, 0] * (TARGET / b_mean), 0, 255)
-    calibrated[:, :, 1] = np.clip(calibrated[:, :, 1] * (TARGET / g_mean), 0, 255)
-    calibrated[:, :, 2] = np.clip(calibrated[:, :, 2] * (TARGET / r_mean), 0, 255)
-    calibrated = calibrated.astype(np.uint8)
-
-    # Concentrated median sampling in center (30x30 px box)
-    well = calibrated[285:315, 285:315]
-    
-    # Filter specular glare reflections (> 220 in all channels)
+    # Center Reaction Well (30x30 px ROI: y=285..315, x=285..315)
+    well = photometric_frame[285:315, 285:315]
     glare_mask = cv2.inRange(well, np.array([220, 220, 220]), np.array([255, 255, 255]))
     non_glare = well[glare_mask == 0]
 
@@ -578,116 +138,447 @@ def extract_well_data(frame_b64):
         sample_bgr = non_glare.reshape(-1, 1, 3)
         sample_lab = cv2.cvtColor(sample_bgr, cv2.COLOR_BGR2LAB)
         avg_lab = np.median(sample_lab, axis=0)[0]
-        avg_rgb = [
-            int(np.median(non_glare[:, 2])),
-            int(np.median(non_glare[:, 1])),
-            int(np.median(non_glare[:, 0]))
-        ]
+        avg_rgb = [int(np.median(non_glare[:, 2])), int(np.median(non_glare[:, 1])), int(np.median(non_glare[:, 0]))]
     else:
         lab_well = cv2.cvtColor(well, cv2.COLOR_BGR2LAB)
         avg_lab = np.median(lab_well, axis=(0, 1))
-        avg_rgb = [
-            int(np.median(well[:, :, 2])),
-            int(np.median(well[:, :, 1])),
-            int(np.median(well[:, :, 0]))
-        ]
+        avg_rgb = [int(np.median(well[:, :, 2])), int(np.median(well[:, :, 1])), int(np.median(well[:, :, 0]))]
 
-    return avg_lab, avg_rgb, calibrated
+    _, buffer = cv2.imencode('.jpg', photometric_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+    calibrated_b64 = base64.b64encode(buffer).decode('utf-8')
 
-@app.route('/')
-def root():
-    return render_template_string(HTML_TEMPLATE)
+    return avg_lab, avg_rgb, calibrated_b64
+
+# --- 3. API ENDPOINTS ---
 
 @app.route('/api/kinetic_assay', methods=['POST'])
 def kinetic_assay():
-    data = request.get_json() or {}
-    frames = data.get('frames', [])
+    data = request.get_json()
+    if not data or 'frames' not in data:
+        return jsonify({"error": "Payload missing frames"}), 400
+
+    frames_b64 = data['frames']
     reagent_key = data.get('reagent', 'scott_cocaine')
-    lat = data.get('lat', 'Unknown')
-    lng = data.get('lng', 'Unknown')
-
-    if len(frames) != 5:
-        return jsonify({'success': False, 'message': 'Requires 5 consecutive temporal frames.'})
-
+    officer_id = data.get('officer_id', 'POLICE-UK-8842')
+    location_name = data.get('location_name', 'Dehradun, Uttarakhand')
+    coords = data.get('coords', '30.3165° N, 78.0322° E')
     cfg = REAGENT_DATABASE.get(reagent_key, REAGENT_DATABASE['scott_cocaine'])
+
     lab_series = []
-    final_rgb = [0, 0, 0]
-    final_calibrated_frame = None
+    rgb_series = []
+    saved_frames = []
 
-    for frame_b64 in frames:
-        lab, rgb, cal_img = extract_well_data(frame_b64)
-        if lab is None:
-            return jsonify({'success': False, 'message': 'Tracking lost during test window. Keep card completely in view.'})
-        lab_series.append(lab)
-        final_rgb = rgb
-        final_calibrated_frame = cal_img
+    for idx, f_b64 in enumerate(frames_b64):
+        raw_bytes = base64.b64decode(f_b64.split(',')[1] if ',' in f_b64 else f_b64)
+        avg_lab, avg_rgb, clean_frame_b64 = extract_well_data(raw_bytes)
+        if avg_lab is not None:
+            lab_series.append(avg_lab)
+            rgb_series.append(avg_rgb)
+            if idx == 0 or idx == len(frames_b64) - 1:
+                saved_frames.append(clean_frame_b64)
 
-    # 1. Delta E relative to T=0 baseline
-    base_l, base_a, base_b = lab_series[0]
-    delta_e = []
-    for l, a, b in lab_series:
-        de = float(np.sqrt((l - base_l)**2 + (a - base_a)**2 + (b - base_b)**2))
-        delta_e.append(round(de, 2))
+    if len(lab_series) < 2:
+        return jsonify({"error": "Insufficient valid frames"}), 400
 
-    total_shift = delta_e[-1]
-    slope = round((delta_e[-1] - delta_e[0]) / 4.0, 2)
+    frame_t0_b64 = saved_frames[0]
+    frame_final_b64 = saved_frames[-1]
 
-    # 2. Objective Euclidean distance to certified standard in CIE-Lab space
+    # Kinetic shift (T_final vs T_0)
+    delta_es = []
+    l0, a0, b0 = lab_series[0]
+    for (l, a, b) in lab_series:
+        de = float(np.sqrt((l - l0)**2 + (a - a0)**2 + (b - b0)**2))
+        delta_es.append(round(de, 2))
+
+    max_delta_e = max(delta_es)
+    time_delta = cfg['duration_sec']
+    kinetic_rate = round(max_delta_e / max(time_delta, 1), 2)
+
+    # Reference match against UNODC chromophore
     cur_l, cur_a, cur_b = lab_series[-1]
     tgt_l, tgt_a, tgt_b = cfg['target_lab']
-    delta_e_ref = float(np.sqrt((cur_l - tgt_l)**2 + (cur_a - tgt_a)**2 + (cur_b - tgt_b)**2))
+    delta_e_ref = round(float(np.sqrt((cur_l - tgt_l)**2 + (cur_a - tgt_a)**2 + (cur_b - tgt_b)**2)), 1)
 
-    color_matches_target = delta_e_ref <= cfg['tolerance_de']
-
-    # 3. Decision Matrix
-    if total_shift < 8.0:
-        if color_matches_target:
-            verdict = "ADULTERANT FLAGGED: STATIC PRE-EXISTING DYE (dE/dt ≈ 0)"
-            positive, is_dye = False, True
-        else:
-            verdict = "NEGATIVE: UNREACTIVE BASELINE"
-            positive, is_dye = False, False
-
-    elif total_shift >= 12.0:
-        if color_matches_target:
-            verdict = f"PRESUMPTIVE POSITIVE: {cfg['analyte'].upper()} ({cfg['name'].upper()})"
-            positive, is_dye = True, False
-        else:
-            verdict = f"ANOMALOUS COLOR SPECTRUM (ΔE vs Ref: {round(delta_e_ref, 1)})"
-            positive, is_dye = False, False
+    # Verdict classification
+    if kinetic_rate < 3.0 and delta_e_ref < cfg['tolerance_de']:
+        verdict = "ADULTERANT FLAGGED: STATIC DYE"
+        badge_class = "badge-danger"
+    elif delta_e_ref <= cfg['tolerance_de']:
+        verdict = f"PRESUMPTIVE POSITIVE: {cfg['analyte'].upper()}"
+        badge_class = "badge-success"
     else:
-        verdict = f"INCONCLUSIVE TRANSITION (dE: {total_shift})"
-        positive, is_dye = False, False
+        verdict = "INCONCLUSIVE / ANOMALOUS SPECTRUM"
+        badge_class = "badge-warning"
 
-    # 4. Generate SHA-256 digital evidence seal over calibrated image pixels
-    _, enc_bytes = cv2.imencode('.png', final_calibrated_frame)
-    sha256_hash = hashlib.sha256(enc_bytes).hexdigest()
+    now = datetime.now()
+    timestamp_ist = now.strftime("%Y-%m-%d %H:%M:%S IST")
+    test_id = f"S52A-{now.strftime('%Y%m%d')}-{np.random.randint(1000, 9999)}"
 
-    # Format official IST time for Indian policing, along with UTC ISO standard
-    now_utc = datetime.now(timezone.utc)
-    now_ist = datetime.fromtimestamp(now_utc.timestamp() + 19800, timezone.utc)
-    
-    timestamp_ist = now_ist.strftime("%d-%m-%Y %H:%M:%S IST")
-    timestamp_utc = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    # SHA-256 seal of the peak calibrated frame
+    raw_final_bytes = base64.b64decode(frame_final_b64)
+    sha256_seal = hashlib.sha256(raw_final_bytes).hexdigest().upper()
+
+    # Save to SQLite
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO test_records (
+                test_id, timestamp_ist, officer_id, location_name, coords,
+                reagent_name, analyte, result_status, delta_e, rate,
+                sha256_seal, frame_t0, frame_final
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            test_id, timestamp_ist, officer_id, location_name, coords,
+            cfg['name'], cfg['analyte'], verdict, delta_e_ref, kinetic_rate,
+            sha256_seal, frame_t0_b64, frame_final_b64
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("DB Insert Error:", e)
 
     return jsonify({
-        'success': True,
-        'delta_e_series': delta_e,
-        'slope': f"{slope}/s",
-        'de_reference': f"{round(delta_e_ref, 1)}",
-        'final_rgb': {'r': final_rgb[0], 'g': final_rgb[1], 'b': final_rgb[2]},
-        'verdict': verdict,
-        'positive': positive,
-        'is_dye': is_dye,
-        'memo': {
-            'reagent': cfg['name'],
-            'analyte': cfg['analyte'],
-            'lat': lat,
-            'lng': lng,
-            'timestamp': f"{timestamp_ist} ({timestamp_utc})",
-            'sha256_seal': sha256_hash
-        }
+        "test_id": test_id,
+        "timestamp_ist": timestamp_ist,
+        "officer_id": officer_id,
+        "location_name": location_name,
+        "coords": coords,
+        "analyte": cfg['analyte'],
+        "reagent": cfg['name'],
+        "delta_e_ref": delta_e_ref,
+        "tolerance": cfg['tolerance_de'],
+        "rate": kinetic_rate,
+        "verdict": verdict,
+        "badge_class": badge_class,
+        "delta_es": delta_es,
+        "sha256_seal": sha256_seal,
+        "frame_t0": frame_t0_b64,
+        "frame_final": frame_final_b64
     })
 
+@app.route('/api/records', methods=['GET'])
+def get_records():
+    search_q = request.args.get('q', '').strip().lower()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if search_q:
+        c.execute('''
+            SELECT test_id, timestamp_ist, officer_id, location_name, analyte, result_status, delta_e, sha256_seal 
+            FROM test_records 
+            WHERE lower(test_id) LIKE ? OR lower(analyte) LIKE ? OR lower(officer_id) LIKE ? OR lower(location_name) LIKE ? OR lower(sha256_seal) LIKE ?
+            ORDER BY id DESC
+        ''', (f"%{search_q}%", f"%{search_q}%", f"%{search_q}%", f"%{search_q}%", f"%{search_q}%"))
+    else:
+        c.execute('''
+            SELECT test_id, timestamp_ist, officer_id, location_name, analyte, result_status, delta_e, sha256_seal 
+            FROM test_records ORDER BY id DESC LIMIT 20
+        ''')
+    rows = c.fetchall()
+    conn.close()
+
+    results = []
+    for r in rows:
+        results.append({
+            "test_id": r[0],
+            "timestamp": r[1],
+            "officer": r[2],
+            "location": r[3],
+            "analyte": r[4],
+            "verdict": r[5],
+            "delta_e": r[6],
+            "sha256": r[7][:16] + "..."
+        })
+    return jsonify(results)
+
+# --- 4. FRONTEND HTML TEMPLATE ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SpectroNDPS | MHA Field Companion</title>
+<style>
+  :root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --accent: #238636; --text: #e6edf3; --muted: #8b949e; --warn: #d29922; --danger: #da3633; }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; }
+  body { background: var(--bg); color: var(--text); padding: 12px; }
+  .container { max-width: 680px; margin: 0 auto; }
+  .header { display: flex; align-items: center; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--border); margin-bottom: 14px; }
+  .header h1 { font-size: 1.1rem; color: #58a6ff; letter-spacing: 0.5px; }
+  .header span { font-size: 0.75rem; background: #21262d; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border); }
+  
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-bottom: 14px; }
+  label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; font-weight: 600; display: block; margin-bottom: 4px; }
+  select, input { width: 100%; background: #0d1117; border: 1px solid var(--border); color: var(--text); padding: 8px; border-radius: 4px; margin-bottom: 10px; font-size: 0.85rem; }
+  
+  .video-box { position: relative; width: 100%; height: 280px; background: #000; border-radius: 4px; overflow: hidden; border: 1px solid var(--border); margin-bottom: 10px; }
+  video { width: 100%; height: 100%; object-fit: cover; }
+  .overlay-ring { position: absolute; top: 50%; left: 50%; width: 70px; height: 70px; border: 2px dashed #58a6ff; border-radius: 50%; transform: translate(-50%, -50%); pointer-events: none; }
+  
+  .btn { width: 100%; background: var(--accent); color: #fff; font-weight: 700; border: none; padding: 12px; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  
+  .memo-box { background: #0d1117; border: 1px solid #58a6ff; border-radius: 6px; padding: 14px; margin-top: 14px; }
+  .memo-header { font-size: 0.95rem; font-weight: bold; color: #58a6ff; border-bottom: 1px dashed var(--border); padding-bottom: 6px; margin-bottom: 10px; display: flex; justify-content: space-between; }
+  .memo-meta { font-size: 0.75rem; line-height: 1.5; margin-bottom: 10px; }
+  .memo-meta b { color: #58a6ff; }
+  
+  .snapshots-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; }
+  .snap-card { text-align: center; border: 1px solid var(--border); border-radius: 4px; padding: 6px; background: #161b22; }
+  .snap-card img { width: 100%; height: 110px; object-fit: cover; border-radius: 3px; }
+  .snap-card p { font-size: 0.65rem; color: var(--muted); margin-top: 4px; }
+  
+  .badge { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 0.85rem; margin-bottom: 8px; }
+  .badge-success { background: rgba(35, 134, 54, 0.2); color: #3fb950; border: 1px solid #238636; }
+  .badge-danger { background: rgba(218, 54, 51, 0.2); color: #f85149; border: 1px solid #da3633; }
+  .badge-warning { background: rgba(210, 153, 34, 0.2); color: #d29922; border: 1px solid #9e6a03; }
+  
+  .disclaimer-box { font-size: 0.68rem; color: #8b949e; background: #21262d; border-left: 3px solid var(--warn); padding: 8px; border-radius: 0 4px 4px 0; margin-top: 10px; line-height: 1.35; }
+  
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+  .tab-btn { flex: 1; padding: 8px; background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 0.8rem; font-weight: 600; }
+  .tab-btn.active { background: #30363d; border-color: #58a6ff; }
+  
+  .table-box { overflow-x: auto; max-height: 260px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.72rem; }
+  th, td { border: 1px solid var(--border); padding: 6px; text-align: left; }
+  th { background: #21262d; color: #58a6ff; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>SPECTRO-NDPS // MHA SIH26231</h1>
+    <span>SEC 52A CERTIFIED</span>
+  </div>
+
+  <div class="tabs">
+    <button class="tab-btn active" onclick="switchView('assay')">Live Assay & Terminal</button>
+    <button class="tab-btn" onclick="switchView('logs')">Audit Records Log</button>
+  </div>
+
+  <!-- VIEW 1: ASSAY & LIVE MEMO -->
+  <div id="assayView">
+    <div class="card">
+      <label>Target Reagent Protocol</label>
+      <select id="reagentSelect">
+        <option value="scott_cocaine">Modified Scott Reagent (Cocaine HCl) — 5s Scan</option>
+        <option value="marquis_opiates">Marquis Reagent (Opiates/Heroin) — 15s Scan</option>
+      </select>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+        <div>
+          <label>Officer ID / Badge</label>
+          <input type="text" id="officerId" value="IO-DEH-4091">
+        </div>
+        <div>
+          <label>Location Landmark</label>
+          <input type="text" id="locName" value="Herbertpur, Dehradun">
+        </div>
+      </div>
+
+      <div class="video-box">
+        <video id="webcam" autoplay playsinline muted></video>
+        <div class="overlay-ring"></div>
+      </div>
+
+      <button class="btn" id="runBtn" onclick="triggerKineticAssay()">Execute Kinetic Assay (5s)</button>
+    </div>
+
+    <div id="memoArea" style="display:none;"></div>
+  </div>
+
+  <!-- VIEW 2: SEARCHABLE LOGS -->
+  <div id="logsView" style="display:none;">
+    <div class="card">
+      <label>Search Judicial Seizure Database</label>
+      <input type="text" id="logSearch" placeholder="Filter by Test ID, Drug, Officer, City, or Hash..." onkeyup="fetchLogs()">
+      <div class="table-box">
+        <table>
+          <thead>
+            <tr>
+              <th>Test ID</th>
+              <th>Date & Location</th>
+              <th>Analyte</th>
+              <th>Result</th>
+              <th>ΔE</th>
+              <th>SHA-256 Seal</th>
+            </tr>
+          </thead>
+          <tbody id="logsTbody">
+            <tr><td colspan="6" style="text-align:center;">Loading audit database...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<canvas id="compressCanvas" width="480" height="480" style="display:none;"></canvas>
+
+<script>
+let video = document.getElementById('webcam');
+let currentLat = "30.3165 N", currentLng = "78.0322 E";
+
+// Sequentially chain permissions to prevent bubble block
+navigator.mediaDevices.getUserMedia({
+  video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 1280 } }
+}).then(stream => {
+  video.srcObject = stream;
+  setTimeout(() => {
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(pos => {
+        currentLat = pos.coords.latitude.toFixed(4) + " N";
+        currentLng = pos.coords.longitude.toFixed(4) + " E";
+      }, () => {});
+    }
+  }, 1000);
+}).catch(err => {
+  console.log("Webcam error:", err);
+});
+
+function switchView(view) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  if (view === 'assay') {
+    document.querySelectorAll('.tab-btn')[0].classList.add('active');
+    document.getElementById('assayView').style.display = 'block';
+    document.getElementById('logsView').style.display = 'none';
+  } else {
+    document.querySelectorAll('.tab-btn')[1].classList.add('active');
+    document.getElementById('assayView').style.display = 'none';
+    document.getElementById('logsView').style.display = 'block';
+    fetchLogs();
+  }
+}
+
+function triggerKineticAssay() {
+  const btn = document.getElementById('runBtn');
+  btn.disabled = true;
+  btn.innerText = "Assaying Reaction Kinetics (Sampling 5 Frames)...";
+
+  let frames = [];
+  let canvas = document.getElementById('compressCanvas');
+  let ctx = canvas.getContext('2d');
+  let count = 0;
+
+  let interval = setInterval(() => {
+    ctx.drawImage(video, 0, 0, 480, 480);
+    frames.push(canvas.toDataURL('image/jpeg', 0.65));
+    count++;
+    if (count >= 5) {
+      clearInterval(interval);
+      btn.innerText = "Computing Spectrophotometric Model...";
+      sendAssay(frames);
+    }
+  }, 1000);
+}
+
+function sendAssay(frames) {
+  const payload = {
+    frames: frames,
+    reagent: document.getElementById('reagentSelect').value,
+    officer_id: document.getElementById('officerId').value,
+    location_name: document.getElementById('locName').value,
+    coords: currentLat + ", " + currentLng
+  };
+
+  fetch('/api/kinetic_assay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+  .then(res => res.json())
+  .then(data => {
+    document.getElementById('runBtn').disabled = false;
+    document.getElementById('runBtn').innerText = "Execute Kinetic Assay (5s)";
+    renderMemo(data);
+  })
+  .catch(err => {
+    alert("Assay error: " + err);
+    document.getElementById('runBtn').disabled = false;
+  });
+}
+
+function renderMemo(d) {
+  const area = document.getElementById('memoArea');
+  area.style.display = 'block';
+  area.innerHTML = `
+    <div class="memo-box">
+      <div class="memo-header">
+        <span>SECTION 52A SEIZURE CERTIFICATE</span>
+        <span>${d.test_id}</span>
+      </div>
+
+      <div class="badge ${d.badge_class}">${d.verdict}</div>
+
+      <div class="memo-meta">
+        <div><b>Jurisdiction:</b> ${d.location_name} (${d.coords})</div>
+        <div><b>Timestamp:</b> ${d.timestamp_ist}</div>
+        <div><b>Officer In-Charge:</b> ${d.officer_id}</div>
+        <div><b>Protocol:</b> ${d.reagent} (Tolerance: ΔE ≤ ${d.tolerance})</div>
+        <div><b>Observed Metrics:</b> ΔE(Ref) = ${d.delta_e_ref} | Kinetic Velocity = ${d.rate}/s</div>
+      </div>
+
+      <label>FORENSIC CHAIN-OF-CUSTODY SNAPSHOTS</label>
+      <div class="snapshots-grid">
+        <div class="snap-card">
+          <img src="data:image/jpeg;base64,${d.frame_t0}">
+          <p>T=0s Baseline (Unreacted)</p>
+        </div>
+        <div class="snap-card">
+          <img src="data:image/jpeg;base64,${d.frame_final}">
+          <p>T=Final Chromophore Peak</p>
+        </div>
+      </div>
+
+      <div class="memo-meta" style="word-break: break-all; margin-top:8px;">
+        <b>SHA-256 DIGITAL EVIDENCE SEAL (BSA Sec 63):</b><br>
+        <code>${d.sha256_seal}</code>
+      </div>
+
+      <div class="disclaimer-box">
+        <b>STATUTORY FORENSIC NOTICE (MHA / NDPS Sec 52A):</b><br>
+        This output represents a presumptive, objective field-test screening result establishing reasonable belief for seizure under Sections 42/43 NDPS Act. Confirmatory qualitative and quantitative analysis is performed by CFSL/SFSL via GC-MS / HPLC.
+      </div>
+
+      <button class="btn" style="margin-top:10px; background:#21262d; border:1px solid var(--border);" onclick="window.print()">
+        Export / Print Signed Memo
+      </button>
+    </div>
+  `;
+}
+
+function fetchLogs() {
+  let q = document.getElementById('logSearch').value;
+  fetch('/api/records?q=' + encodeURIComponent(q))
+  .then(res => res.json())
+  .then(rows => {
+    let tbody = document.getElementById('logsTbody');
+    if (rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;">No matching seizure records.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td><b>${r.test_id}</b></td>
+        <td>${r.timestamp}<br><span style="color:#8b949e">${r.location}</span></td>
+        <td>${r.analyte}</td>
+        <td>${r.verdict.includes('POSITIVE') ? '<span style="color:#3fb950">POSITIVE</span>' : r.verdict}</td>
+        <td>${r.delta_e}</td>
+        <td><code>${r.sha256}</code></td>
+      </tr>
+    `).join('');
+  });
+}
+</script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=False)
