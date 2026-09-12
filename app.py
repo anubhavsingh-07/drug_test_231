@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# --- 1. SQLITE DATABASE INITIALIZATION ---
+# --- 1. LOCAL SQLITE DATABASE (MHA AUDIT LOG) ---
 DB_FILE = "spectro_ndps_records.db"
 
 def init_db():
@@ -41,26 +41,59 @@ def init_db():
 
 init_db()
 
-# --- 2. REAGENT & ARUCO CONFIGURATION ---
+# --- 2. EXPANDED REAGENT DATABASE (NARCOTICS & DIVERTED PHARMACEUTICALS) ---
 REAGENT_DATABASE = {
     "scott_cocaine": {
-        "name": "Modified Scott (Cobalt Thiocyanate)",
+        "name": "Modified Scott Reagent (Cobalt Thiocyanate)",
         "analyte": "Cocaine HCl",
+        "category": "Illicit Narcotic",
         "duration_sec": 5,
         "target_lab": [82.0, 152.0, 69.0],
-        "tolerance_de": 42.0,
-        "ndps_schedule": "Schedule I (Commercial / Small)"
+        "tolerance_de": 42.0
     },
-    "marquis_opiates": {
-        "name": "Marquis Reagent (Formaldehyde/H2SO4)",
-        "analyte": "Opiates / Heroin",
+    "marquis_codeine": {
+        "name": "Marquis Reagent (Formaldehyde / Conc. H2SO4)",
+        "analyte": "Codeine (Diverted Pharmaceutical Syrup/Tablets)",
+        "category": "Regulated Prescription Pharmaceutical",
+        "duration_sec": 15,
+        "target_lab": [70.0, 150.0, 105.0],
+        "tolerance_de": 40.0
+    },
+    "marquis_heroin": {
+        "name": "Marquis Reagent (Formaldehyde / Conc. H2SO4)",
+        "analyte": "Heroin / Morphine (Opiates)",
+        "category": "Illicit Narcotic",
         "duration_sec": 15,
         "target_lab": [75.0, 148.0, 115.0],
-        "tolerance_de": 38.0,
-        "ndps_schedule": "Schedule I (Narcotic Drug)"
+        "tolerance_de": 38.0
+    },
+    "dille_barbiturates": {
+        "name": "Dille-Koppanyi Reagent (Cobalt Acetate / Isopropylamine)",
+        "analyte": "Barbiturates (Prescription Sedatives)",
+        "category": "Regulated Prescription Pharmaceutical",
+        "duration_sec": 10,
+        "target_lab": [95.0, 145.0, 90.0],
+        "tolerance_de": 40.0
+    },
+    "mandelin_amphetamines": {
+        "name": "Mandelin Reagent (Ammonium Metavanadate / H2SO4)",
+        "analyte": "Amphetamine / Methadone",
+        "category": "Scheduled Synthetic Substance",
+        "duration_sec": 20,
+        "target_lab": [110.0, 145.0, 165.0],
+        "tolerance_de": 42.0
+    },
+    "duquenois_cannabis": {
+        "name": "Duquenois-Levine Reagent (Acetaldehyde / Vanillin)",
+        "analyte": "Cannabinoids (THC / Hashish)",
+        "category": "Illicit Narcotic",
+        "duration_sec": 30,
+        "target_lab": [88.0, 142.0, 110.0],
+        "tolerance_de": 45.0
     }
 }
 
+# --- 3. ARUCO FIDUCIAL MARKER SETUP ---
 ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)
 if hasattr(cv2.aruco, 'DetectorParameters'):
     ARUCO_PARAMS = cv2.aruco.DetectorParameters()
@@ -84,7 +117,7 @@ def extract_well_data(frame_bytes):
     nparr = np.frombuffer(frame_bytes, np.uint8)
     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if frame is None:
-        return None, None, None
+        return None, None, None, "Invalid image stream"
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
@@ -95,27 +128,26 @@ def extract_well_data(frame_bytes):
     else:
         corners, ids, _ = cv2.aruco.detectMarkers(gray_boosted, ARUCO_DICT, parameters=ARUCO_PARAMS)
 
+    # STRICT CHECK: Reject if calibration card markers are not detected
     if ids is None or len(ids) < 4:
-        # Fallback orthogonal crop if markers occluded
-        h, w = frame.shape[:2]
-        size = min(h, w)
-        sy, sx = (h - size) // 2, (w - size) // 2
-        calibrated = cv2.resize(frame[sy:sy+size, sx:sx+size], (600, 600))
-    else:
-        pts_src = []
-        id_order = [0, 1, 2, 3]
-        flat_ids = ids.flatten().tolist()
-        for marker_id in id_order:
-            if marker_id in flat_ids:
-                idx = flat_ids.index(marker_id)
-                pts_src.append(corners[idx][0][0])
-            else:
-                pts_src.append([0, 0])
-        pts_dst = np.array([[0, 0], [600, 0], [600, 600], [0, 600]], dtype="float32")
-        h_matrix = cv2.getPerspectiveTransform(np.array(pts_src, dtype="float32"), pts_dst)
-        calibrated = cv2.warpPerspective(frame, h_matrix, (600, 600))
+        return None, None, None, "CALIBRATION_CARD_MISSING"
 
-    # 18% Neutral Gray Calibration Patch (Top Center: y=80..130, x=270..330)
+    pts_src = []
+    id_order = [0, 1, 2, 3]
+    flat_ids = ids.flatten().tolist()
+    
+    for marker_id in id_order:
+        if marker_id in flat_ids:
+            idx = flat_ids.index(marker_id)
+            pts_src.append(corners[idx][0][0])
+        else:
+            return None, None, None, "CALIBRATION_CARD_MISSING"
+
+    pts_dst = np.array([[0, 0], [600, 0], [600, 600], [0, 600]], dtype="float32")
+    h_matrix = cv2.getPerspectiveTransform(np.array(pts_src, dtype="float32"), pts_dst)
+    calibrated = cv2.warpPerspective(frame, h_matrix, (600, 600))
+
+    # 18% Neutral Gray Patch (Top Center: y=80..130, x=270..330)
     gray_roi = calibrated[80:130, 270:330]
     mean_bgr = np.mean(gray_roi, axis=(0, 1))
     mean_b, mean_g, mean_r = max(mean_bgr[0], 1), max(mean_bgr[1], 1), max(mean_bgr[2], 1)
@@ -129,7 +161,7 @@ def extract_well_data(frame_bytes):
     cal_r = np.clip(calibrated[:, :, 2] * scale_r, 0, 255).astype(np.uint8)
     photometric_frame = cv2.merge([cal_b, cal_g, cal_r])
 
-    # Center Reaction Well (30x30 px ROI: y=285..315, x=285..315)
+    # Reaction Well (Center 30x30 ROI)
     well = photometric_frame[285:315, 285:315]
     glare_mask = cv2.inRange(well, np.array([220, 220, 220]), np.array([255, 255, 255]))
     non_glare = well[glare_mask == 0]
@@ -144,12 +176,12 @@ def extract_well_data(frame_bytes):
         avg_lab = np.median(lab_well, axis=(0, 1))
         avg_rgb = [int(np.median(well[:, :, 2])), int(np.median(well[:, :, 1])), int(np.median(well[:, :, 0]))]
 
-    _, buffer = cv2.imencode('.jpg', photometric_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+    _, buffer = cv2.imencode('.jpg', photometric_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
     calibrated_b64 = base64.b64encode(buffer).decode('utf-8')
 
-    return avg_lab, avg_rgb, calibrated_b64
+    return avg_lab, avg_rgb, calibrated_b64, None
 
-# --- 3. API ENDPOINTS ---
+# --- 4. FLASK API ENDPOINTS ---
 
 @app.route('/api/kinetic_assay', methods=['POST'])
 def kinetic_assay():
@@ -159,9 +191,9 @@ def kinetic_assay():
 
     frames_b64 = data['frames']
     reagent_key = data.get('reagent', 'scott_cocaine')
-    officer_id = data.get('officer_id', 'POLICE-UK-8842')
+    officer_id = data.get('officer_id', 'IO-SEC-52A')
     location_name = data.get('location_name', 'Dehradun, Uttarakhand')
-    coords = data.get('coords', '30.3165° N, 78.0322° E')
+    coords = data.get('coords', '30.3165 N, 78.0322 E')
     cfg = REAGENT_DATABASE.get(reagent_key, REAGENT_DATABASE['scott_cocaine'])
 
     lab_series = []
@@ -170,7 +202,13 @@ def kinetic_assay():
 
     for idx, f_b64 in enumerate(frames_b64):
         raw_bytes = base64.b64decode(f_b64.split(',')[1] if ',' in f_b64 else f_b64)
-        avg_lab, avg_rgb, clean_frame_b64 = extract_well_data(raw_bytes)
+        avg_lab, avg_rgb, clean_frame_b64, err = extract_well_data(raw_bytes)
+        
+        if err == "CALIBRATION_CARD_MISSING":
+            return jsonify({
+                "error": "Card Not Detected: All 4 corner ArUco markers and the reference card must be clearly aligned inside the camera viewport."
+            }), 422
+            
         if avg_lab is not None:
             lab_series.append(avg_lab)
             rgb_series.append(avg_rgb)
@@ -178,12 +216,12 @@ def kinetic_assay():
                 saved_frames.append(clean_frame_b64)
 
     if len(lab_series) < 2:
-        return jsonify({"error": "Insufficient valid frames"}), 400
+        return jsonify({"error": "Insufficient calibrated frames captured."}), 400
 
     frame_t0_b64 = saved_frames[0]
     frame_final_b64 = saved_frames[-1]
 
-    # Kinetic shift (T_final vs T_0)
+    # Reaction velocity (dE/dt)
     delta_es = []
     l0, a0, b0 = lab_series[0]
     for (l, a, b) in lab_series:
@@ -194,14 +232,14 @@ def kinetic_assay():
     time_delta = cfg['duration_sec']
     kinetic_rate = round(max_delta_e / max(time_delta, 1), 2)
 
-    # Reference match against UNODC chromophore
+    # Reference distance (ISO/CIE 11664-4)
     cur_l, cur_a, cur_b = lab_series[-1]
     tgt_l, tgt_a, tgt_b = cfg['target_lab']
     delta_e_ref = round(float(np.sqrt((cur_l - tgt_l)**2 + (cur_a - tgt_a)**2 + (cur_b - tgt_b)**2)), 1)
 
-    # Verdict classification
+    # Official MHA Outcome Categories
     if kinetic_rate < 3.0 and delta_e_ref < cfg['tolerance_de']:
-        verdict = "ADULTERANT FLAGGED: STATIC DYE"
+        verdict = "ADULTERANT FLAGGED: STATIC PRE-EXISTING DYE"
         badge_class = "badge-danger"
     elif delta_e_ref <= cfg['tolerance_de']:
         verdict = f"PRESUMPTIVE POSITIVE: {cfg['analyte'].upper()}"
@@ -214,11 +252,11 @@ def kinetic_assay():
     timestamp_ist = now.strftime("%Y-%m-%d %H:%M:%S IST")
     test_id = f"S52A-{now.strftime('%Y%m%d')}-{np.random.randint(1000, 9999)}"
 
-    # SHA-256 seal of the peak calibrated frame
+    # SHA-256 seal of calibrated final image bytes
     raw_final_bytes = base64.b64decode(frame_final_b64)
     sha256_seal = hashlib.sha256(raw_final_bytes).hexdigest().upper()
 
-    # Save to SQLite
+    # Save to SQLite audit log
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -236,7 +274,7 @@ def kinetic_assay():
         conn.commit()
         conn.close()
     except Exception as e:
-        print("DB Insert Error:", e)
+        print("DB Save Error:", e)
 
     return jsonify({
         "test_id": test_id,
@@ -245,6 +283,7 @@ def kinetic_assay():
         "location_name": location_name,
         "coords": coords,
         "analyte": cfg['analyte'],
+        "category": cfg['category'],
         "reagent": cfg['name'],
         "delta_e_ref": delta_e_ref,
         "tolerance": cfg['tolerance_de'],
@@ -272,7 +311,7 @@ def get_records():
     else:
         c.execute('''
             SELECT test_id, timestamp_ist, officer_id, location_name, analyte, result_status, delta_e, sha256_seal 
-            FROM test_records ORDER BY id DESC LIMIT 20
+            FROM test_records ORDER BY id DESC LIMIT 25
         ''')
     rows = c.fetchall()
     conn.close()
@@ -287,46 +326,46 @@ def get_records():
             "analyte": r[4],
             "verdict": r[5],
             "delta_e": r[6],
-            "sha256": r[7][:16] + "..."
+            "sha256": r[7]
         })
     return jsonify(results)
 
-# --- 4. FRONTEND HTML TEMPLATE ---
+# --- 5. FRONTEND HTML & RESPONSIVE UI ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SpectroNDPS | MHA Field Companion</title>
+<title>SpectroNDPS | MHA SIH26231 Field Companion</title>
 <style>
   :root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --accent: #238636; --text: #e6edf3; --muted: #8b949e; --warn: #d29922; --danger: #da3633; }
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; }
   body { background: var(--bg); color: var(--text); padding: 12px; }
   .container { max-width: 680px; margin: 0 auto; }
   .header { display: flex; align-items: center; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--border); margin-bottom: 14px; }
-  .header h1 { font-size: 1.1rem; color: #58a6ff; letter-spacing: 0.5px; }
-  .header span { font-size: 0.75rem; background: #21262d; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border); }
+  .header h1 { font-size: 1.05rem; color: #58a6ff; letter-spacing: 0.5px; }
+  .header span { font-size: 0.72rem; background: #21262d; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border); }
   
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-bottom: 14px; }
-  label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; font-weight: 600; display: block; margin-bottom: 4px; }
+  label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; font-weight: 600; display: block; margin-bottom: 4px; }
   select, input { width: 100%; background: #0d1117; border: 1px solid var(--border); color: var(--text); padding: 8px; border-radius: 4px; margin-bottom: 10px; font-size: 0.85rem; }
   
-  .video-box { position: relative; width: 100%; height: 280px; background: #000; border-radius: 4px; overflow: hidden; border: 1px solid var(--border); margin-bottom: 10px; }
+  .video-box { position: relative; width: 100%; height: 260px; background: #000; border-radius: 4px; overflow: hidden; border: 1px solid var(--border); margin-bottom: 10px; }
   video { width: 100%; height: 100%; object-fit: cover; }
   .overlay-ring { position: absolute; top: 50%; left: 50%; width: 70px; height: 70px; border: 2px dashed #58a6ff; border-radius: 50%; transform: translate(-50%, -50%); pointer-events: none; }
   
   .btn { width: 100%; background: var(--accent); color: #fff; font-weight: 700; border: none; padding: 12px; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn:disabled { opacity: 0.65; cursor: not-allowed; background: #30363d; }
   
   .memo-box { background: #0d1117; border: 1px solid #58a6ff; border-radius: 6px; padding: 14px; margin-top: 14px; }
-  .memo-header { font-size: 0.95rem; font-weight: bold; color: #58a6ff; border-bottom: 1px dashed var(--border); padding-bottom: 6px; margin-bottom: 10px; display: flex; justify-content: space-between; }
+  .memo-header { font-size: 0.9rem; font-weight: bold; color: #58a6ff; border-bottom: 1px dashed var(--border); padding-bottom: 6px; margin-bottom: 10px; display: flex; justify-content: space-between; }
   .memo-meta { font-size: 0.75rem; line-height: 1.5; margin-bottom: 10px; }
   .memo-meta b { color: #58a6ff; }
   
   .snapshots-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; }
   .snap-card { text-align: center; border: 1px solid var(--border); border-radius: 4px; padding: 6px; background: #161b22; }
-  .snap-card img { width: 100%; height: 110px; object-fit: cover; border-radius: 3px; }
+  .snap-card img { width: 100%; height: 120px; object-fit: cover; border-radius: 3px; }
   .snap-card p { font-size: 0.65rem; color: var(--muted); margin-top: 4px; }
   
   .badge { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 0.85rem; margin-bottom: 8px; }
@@ -334,47 +373,68 @@ HTML_TEMPLATE = """
   .badge-danger { background: rgba(218, 54, 51, 0.2); color: #f85149; border: 1px solid #da3633; }
   .badge-warning { background: rgba(210, 153, 34, 0.2); color: #d29922; border: 1px solid #9e6a03; }
   
+  .sha-box { background: #000; border: 1px solid var(--border); padding: 8px; border-radius: 4px; font-size: 0.73rem; word-break: break-all; color: #58a6ff; font-family: monospace; line-height: 1.4; margin-top: 4px; }
+  
   .disclaimer-box { font-size: 0.68rem; color: #8b949e; background: #21262d; border-left: 3px solid var(--warn); padding: 8px; border-radius: 0 4px 4px 0; margin-top: 10px; line-height: 1.35; }
   
   .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
   .tab-btn { flex: 1; padding: 8px; background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 0.8rem; font-weight: 600; }
   .tab-btn.active { background: #30363d; border-color: #58a6ff; }
   
-  .table-box { overflow-x: auto; max-height: 260px; }
+  .table-box { overflow-x: auto; max-height: 280px; }
   table { width: 100%; border-collapse: collapse; font-size: 0.72rem; }
   th, td { border: 1px solid var(--border); padding: 6px; text-align: left; }
   th { background: #21262d; color: #58a6ff; }
+
+  /* DEDICATED PRINT STYLESHEET (PDF CLEAN EXPORT) */
+  @media print {
+    body { background: #fff !important; color: #000 !important; padding: 0 !important; }
+    .header, .tabs, #assayView > .card, #logsView, .print-hide { display: none !important; }
+    #memoArea { display: block !important; margin: 0 !important; padding: 0 !important; border: none !important; }
+    .memo-box { border: 2px solid #000 !important; background: #fff !important; color: #000 !important; page-break-inside: avoid !important; }
+    .memo-header { color: #000 !important; border-bottom: 2px solid #000 !important; }
+    .memo-meta b { color: #000 !important; }
+    .badge { border: 1px solid #000 !important; color: #000 !important; background: #eee !important; }
+    .snap-card { border: 1px solid #000 !important; background: #fff !important; }
+    .snap-card p { color: #000 !important; }
+    .sha-box { background: #f4f4f4 !important; color: #000 !important; border: 1px solid #000 !important; }
+    .disclaimer-box { background: #f0f0f0 !important; color: #000 !important; border-left: 4px solid #000 !important; }
+  }
 </style>
 </head>
 <body>
 <div class="container">
   <div class="header">
     <h1>SPECTRO-NDPS // MHA SIH26231</h1>
-    <span>SEC 52A CERTIFIED</span>
+    <span>SEC 52A NDPS CERTIFIED</span>
   </div>
 
   <div class="tabs">
-    <button class="tab-btn active" onclick="switchView('assay')">Live Assay & Terminal</button>
-    <button class="tab-btn" onclick="switchView('logs')">Audit Records Log</button>
+    <button class="tab-btn active" onclick="switchView('assay')">Field Testing Terminal</button>
+    <button class="tab-btn" onclick="switchView('logs')">Judicial Audit Log</button>
   </div>
 
-  <!-- VIEW 1: ASSAY & LIVE MEMO -->
+  <!-- TAB 1: FIELD TESTING TERMINAL -->
   <div id="assayView">
     <div class="card">
-      <label>Target Reagent Protocol</label>
-      <select id="reagentSelect">
-        <option value="scott_cocaine">Modified Scott Reagent (Cocaine HCl) — 5s Scan</option>
-        <option value="marquis_opiates">Marquis Reagent (Opiates/Heroin) — 15s Scan</option>
+      <label>Select Target Reagent Protocol</label>
+      <select id="reagentSelect" onchange="updateButtonText()">
+        <option value="scott_cocaine" data-dur="5">Modified Scott Reagent (Cocaine HCl) — 5s Scan</option>
+        <option value="marquis_codeine" data-dur="15">Marquis Reagent (Codeine / Diverted Pharmaceuticals) — 15s Scan</option>
+        <option value="marquis_heroin" data-dur="15">Marquis Reagent (Heroin / General Opiates) — 15s Scan</option>
+        <option value="dille_barbiturates" data-dur="10">Dille-Koppanyi (Barbiturates / Prescription Sedatives) — 10s Scan</option>
+        <option value="mandelin_amphetamines" data-dur="20">Mandelin Reagent (Amphetamines / Methadone) — 20s Scan</option>
+        <option value="duquenois_cannabis" data-dur="30">Duquenois-Levine Reagent (Cannabis / THC) — 30s Scan</option>
       </select>
 
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
         <div>
           <label>Officer ID / Badge</label>
-          <input type="text" id="officerId" value="IO-DEH-4091">
+          <input type="text" id="officerId" value="IO-UK-8842">
         </div>
         <div>
-          <label>Location Landmark</label>
-          <input type="text" id="locName" value="Herbertpur, Dehradun">
+          <label>Seizure Jurisdiction</label>
+          <input type="text" id="locName" value="Dehradun, Uttarakhand">
         </div>
       </div>
 
@@ -389,11 +449,11 @@ HTML_TEMPLATE = """
     <div id="memoArea" style="display:none;"></div>
   </div>
 
-  <!-- VIEW 2: SEARCHABLE LOGS -->
+  <!-- TAB 2: SEARCHABLE AUDIT LOG -->
   <div id="logsView" style="display:none;">
     <div class="card">
       <label>Search Judicial Seizure Database</label>
-      <input type="text" id="logSearch" placeholder="Filter by Test ID, Drug, Officer, City, or Hash..." onkeyup="fetchLogs()">
+      <input type="text" id="logSearch" placeholder="Filter by Test ID, Drug Analyte, Officer, City, or SHA-256 Seal..." onkeyup="fetchLogs()">
       <div class="table-box">
         <table>
           <thead>
@@ -401,9 +461,9 @@ HTML_TEMPLATE = """
               <th>Test ID</th>
               <th>Date & Location</th>
               <th>Analyte</th>
-              <th>Result</th>
+              <th>Outcome</th>
               <th>ΔE</th>
-              <th>SHA-256 Seal</th>
+              <th>SHA-256 Digital Seal</th>
             </tr>
           </thead>
           <tbody id="logsTbody">
@@ -421,22 +481,43 @@ HTML_TEMPLATE = """
 let video = document.getElementById('webcam');
 let currentLat = "30.3165 N", currentLng = "78.0322 E";
 
-// Sequentially chain permissions to prevent bubble block
+// Request camera first, then fetch live reverse-geocoded location
 navigator.mediaDevices.getUserMedia({
   video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 1280 } }
 }).then(stream => {
   video.srcObject = stream;
-  setTimeout(() => {
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(pos => {
-        currentLat = pos.coords.latitude.toFixed(4) + " N";
-        currentLng = pos.coords.longitude.toFixed(4) + " E";
-      }, () => {});
-    }
-  }, 1000);
+  setTimeout(detectLocation, 800);
 }).catch(err => {
   console.log("Webcam error:", err);
 });
+
+function detectLocation() {
+  if (navigator.geolocation) {
+    navigator.geolocation.getCurrentPosition(pos => {
+      const lat = pos.coords.latitude;
+      const lon = pos.coords.longitude;
+      currentLat = lat.toFixed(4) + " N";
+      currentLng = lon.toFixed(4) + " E";
+
+      // Reverse geocode directly from OpenStreetMap
+      fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}`)
+        .then(res => res.json())
+        .then(geo => {
+          if (geo && geo.address) {
+            const city = geo.address.city || geo.address.town || geo.address.county || geo.address.state_district || "District";
+            const state = geo.address.state || "India";
+            document.getElementById('locName').value = `${city}, ${state}`;
+          }
+        }).catch(() => {});
+    }, () => {}, { enableHighAccuracy: true, timeout: 6000 });
+  }
+}
+
+function updateButtonText() {
+  const sel = document.getElementById('reagentSelect');
+  const dur = sel.options[sel.selectedIndex].getAttribute('data-dur');
+  document.getElementById('runBtn').innerText = `Execute Kinetic Assay (${dur}s)`;
+}
 
 function switchView(view) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -454,24 +535,42 @@ function switchView(view) {
 
 function triggerKineticAssay() {
   const btn = document.getElementById('runBtn');
+  const sel = document.getElementById('reagentSelect');
+  const totalSec = parseInt(sel.options[sel.selectedIndex].getAttribute('data-dur'));
+  
   btn.disabled = true;
-  btn.innerText = "Assaying Reaction Kinetics (Sampling 5 Frames)...";
+  let remaining = totalSec;
+  btn.innerText = `Assaying Reaction Kinetics (${remaining}s remaining)...`;
 
   let frames = [];
   let canvas = document.getElementById('compressCanvas');
   let ctx = canvas.getContext('2d');
-  let count = 0;
+  
+  // Sample 5 frames spaced evenly across the total reagent duration
+  const sampleIntervalMs = (totalSec * 1000) / 4;
+  let sampleCount = 0;
 
-  let interval = setInterval(() => {
-    ctx.drawImage(video, 0, 0, 480, 480);
-    frames.push(canvas.toDataURL('image/jpeg', 0.65));
-    count++;
-    if (count >= 5) {
-      clearInterval(interval);
+  // Visual countdown timer updating every 1 second
+  let countdownTimer = setInterval(() => {
+    remaining--;
+    if (remaining > 0) {
+      btn.innerText = `Assaying Reaction Kinetics (${remaining}s remaining)...`;
+    } else {
       btn.innerText = "Computing Spectrophotometric Model...";
-      sendAssay(frames);
+      clearInterval(countdownTimer);
     }
   }, 1000);
+
+  // Frame sampling interval
+  let frameSampler = setInterval(() => {
+    ctx.drawImage(video, 0, 0, 480, 480);
+    frames.push(canvas.toDataURL('image/jpeg', 0.70));
+    sampleCount++;
+    if (sampleCount >= 5) {
+      clearInterval(frameSampler);
+      sendAssay(frames);
+    }
+  }, sampleIntervalMs);
 }
 
 function sendAssay(frames) {
@@ -488,15 +587,20 @@ function sendAssay(frames) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   })
-  .then(res => res.json())
-  .then(data => {
+  .then(res => res.json().then(data => ({ status: res.status, body: data })))
+  .then(res => {
     document.getElementById('runBtn').disabled = false;
-    document.getElementById('runBtn').innerText = "Execute Kinetic Assay (5s)";
-    renderMemo(data);
+    updateButtonText();
+    if (res.status !== 200) {
+      alert(res.body.error || "Assay verification failed.");
+      return;
+    }
+    renderMemo(res.body);
   })
   .catch(err => {
-    alert("Assay error: " + err);
+    alert("Connection error: " + err);
     document.getElementById('runBtn').disabled = false;
+    updateButtonText();
   });
 }
 
@@ -506,44 +610,45 @@ function renderMemo(d) {
   area.innerHTML = `
     <div class="memo-box">
       <div class="memo-header">
-        <span>SECTION 52A SEIZURE CERTIFICATE</span>
+        <span>SECTION 52A NDPS DIGITAL SEIZURE CERTIFICATE</span>
         <span>${d.test_id}</span>
       </div>
 
       <div class="badge ${d.badge_class}">${d.verdict}</div>
 
       <div class="memo-meta">
-        <div><b>Jurisdiction:</b> ${d.location_name} (${d.coords})</div>
-        <div><b>Timestamp:</b> ${d.timestamp_ist}</div>
+        <div><b>Target Analyte:</b> ${d.analyte} (${d.category})</div>
+        <div><b>Jurisdiction:</b> ${d.location_name} [${d.coords}]</div>
+        <div><b>Seizure Timestamp:</b> ${d.timestamp_ist}</div>
         <div><b>Officer In-Charge:</b> ${d.officer_id}</div>
-        <div><b>Protocol:</b> ${d.reagent} (Tolerance: ΔE ≤ ${d.tolerance})</div>
-        <div><b>Observed Metrics:</b> ΔE(Ref) = ${d.delta_e_ref} | Kinetic Velocity = ${d.rate}/s</div>
+        <div><b>Applied Protocol:</b> ${d.reagent} (Target Tolerance: ΔE ≤ ${d.tolerance})</div>
+        <div><b>Colorimetric Metrics:</b> Observed ΔE(Ref) = ${d.delta_e_ref} | Kinetic Velocity = ${d.rate}/s</div>
       </div>
 
       <label>FORENSIC CHAIN-OF-CUSTODY SNAPSHOTS</label>
       <div class="snapshots-grid">
         <div class="snap-card">
           <img src="data:image/jpeg;base64,${d.frame_t0}">
-          <p>T=0s Baseline (Unreacted)</p>
+          <p>T=0s Baseline (Unreacted Sample)</p>
         </div>
         <div class="snap-card">
           <img src="data:image/jpeg;base64,${d.frame_final}">
-          <p>T=Final Chromophore Peak</p>
+          <p>T=Final Peak Chromophore Formation</p>
         </div>
       </div>
 
-      <div class="memo-meta" style="word-break: break-all; margin-top:8px;">
-        <b>SHA-256 DIGITAL EVIDENCE SEAL (BSA Sec 63):</b><br>
-        <code>${d.sha256_seal}</code>
+      <div class="memo-meta" style="margin-top: 8px;">
+        <b>SHA-256 DIGITAL EVIDENCE SEAL (BSA SEC 63):</b>
+        <div class="sha-box">${d.sha256_seal}</div>
       </div>
 
       <div class="disclaimer-box">
-        <b>STATUTORY FORENSIC NOTICE (MHA / NDPS Sec 52A):</b><br>
-        This output represents a presumptive, objective field-test screening result establishing reasonable belief for seizure under Sections 42/43 NDPS Act. Confirmatory qualitative and quantitative analysis is performed by CFSL/SFSL via GC-MS / HPLC.
+        <b>STATUTORY FORENSIC NOTICE (MHA SIH26231 / NDPS SEC 52A):</b><br>
+        This test record represents a presumptive field-test result and a supporting digital record establishing reasonable belief for seizure under Sections 42/43 of the NDPS Act. Confirmatory qualitative and quantitative analysis is performed by CFSL/SFSL via GC-MS / HPLC.
       </div>
 
-      <button class="btn" style="margin-top:10px; background:#21262d; border:1px solid var(--border);" onclick="window.print()">
-        Export / Print Signed Memo
+      <button class="btn print-hide" style="margin-top:12px; background:#21262d; border:1px solid var(--border);" onclick="window.print()">
+        Export / Print Signed Memo (PDF)
       </button>
     </div>
   `;
@@ -556,7 +661,7 @@ function fetchLogs() {
   .then(rows => {
     let tbody = document.getElementById('logsTbody');
     if (rows.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;">No matching seizure records.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;">No matching seizure records found.</td></tr>';
       return;
     }
     tbody.innerHTML = rows.map(r => `
@@ -564,9 +669,9 @@ function fetchLogs() {
         <td><b>${r.test_id}</b></td>
         <td>${r.timestamp}<br><span style="color:#8b949e">${r.location}</span></td>
         <td>${r.analyte}</td>
-        <td>${r.verdict.includes('POSITIVE') ? '<span style="color:#3fb950">POSITIVE</span>' : r.verdict}</td>
+        <td>${r.verdict.includes('POSITIVE') ? '<span style="color:#3fb950; font-weight:bold;">POSITIVE</span>' : r.verdict}</td>
         <td>${r.delta_e}</td>
-        <td><code>${r.sha256}</code></td>
+        <td><span style="font-family:monospace; font-size:0.68rem;">${r.sha256.substring(0, 16)}...</span></td>
       </tr>
     `).join('');
   });
